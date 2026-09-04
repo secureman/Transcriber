@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+httpx
+groq
+aiosqlite
+aiofiles
+pydantic-settings
+python-dotenv
