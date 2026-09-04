@@ -17,6 +17,11 @@ class PlayerController extends Notifier<PlayerState> {
   Timer? _vttPollTimer;
   Timer? _sleepTimer;
   StreamSubscription<Duration>? _positionSub;
+  // BUG FIX: the previous version added a new `processingStateStream.listen`
+  // on every `_loadAudio` call without cancelling the previous one. After
+  // N chapter skips you had N listeners all firing `_onChapterEnd` on
+  // completion → cascading skips. Now we keep exactly one.
+  StreamSubscription<ProcessingState>? _processingSub;
   int _lastEmitMs = 0;
   int _loadedChapterIndex = -1;
 
@@ -30,6 +35,7 @@ class PlayerController extends Notifier<PlayerState> {
     _vttPollTimer?.cancel();
     _sleepTimer?.cancel();
     _positionSub?.cancel();
+    _processingSub?.cancel();
   }
 
   /// Entry point: loads chapter audio and VTT in parallel.
@@ -39,6 +45,7 @@ class PlayerController extends Notifier<PlayerState> {
 
     _vttPollTimer?.cancel();
     _positionSub?.cancel();
+    _processingSub?.cancel();
     _loadedChapterIndex = chapterIndex;
 
     final prefs = ref.read(sharedPrefsProvider);
@@ -80,6 +87,7 @@ class PlayerController extends Notifier<PlayerState> {
 
     final chIndex = chapterIndex.clamp(0, item.chapters.length - 1);
     final chapter = item.chapters[chIndex];
+    final totalChapters = item.chapters.length;
 
     final files = item.audioFiles
         .map((f) => (ino: f.ino, duration: f.duration))
@@ -99,7 +107,7 @@ class PlayerController extends Notifier<PlayerState> {
       title: item.title,
       artist: item.author.isEmpty ? null : item.author,
       chapterNumber: chIndex + 1,
-      totalChapters: item.chapters.length,
+      totalChapters: totalChapters,
     );
 
     state = state.copyWith(
@@ -108,9 +116,11 @@ class PlayerController extends Notifier<PlayerState> {
       chapterDuration: chapter.duration.asDuration,
       position: Duration.zero,
       chapterIndex: chIndex,
+      totalChapters: totalChapters,
     );
 
-    handler.player.processingStateStream.listen((ps) {
+    // Single subscription, cancellable on next chapter load. See _cleanup.
+    _processingSub = handler.player.processingStateStream.listen((ps) {
       if (ps == ProcessingState.completed) _onChapterEnd();
     });
   }
@@ -276,6 +286,13 @@ class PlayerController extends Notifier<PlayerState> {
     await ref.read(audioHandlerProvider).play();
   }
 
+  /// Restart the book from chapter 0. Used after the "End of book" state
+  /// is reached and the user wants to go again.
+  Future<void> restart() async {
+    if (state.itemId == null) return;
+    await switchChapter(0);
+  }
+
   Future<void> nextChapter() => switchChapter(state.chapterIndex + 1);
 
   Future<void> prevChapter() => switchChapter(state.chapterIndex - 1);
@@ -284,6 +301,14 @@ class PlayerController extends Notifier<PlayerState> {
     // Sleep "end of chapter": stop here and cancel the timer.
     if (state.sleepTimer == SleepTimerState.endOfChapter) {
       setSleepTimer(SleepTimerState.off);
+      return;
+    }
+    // BUG FIX: previously, on the LAST chapter this called nextChapter()
+    // which tried to load chapterIndex+1 → threw "Book has no chapters
+    // or audio files" and the player died silently. Now we stop, mark
+    // finished=true, and let the UI react.
+    if (state.isOnLastChapter) {
+      state = state.copyWith(playing: false, finished: true);
       return;
     }
     // Auto-advance to the next chapter.

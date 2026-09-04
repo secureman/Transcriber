@@ -73,8 +73,10 @@ final bookDetailProvider =
 final chapterStatusProvider =
     StreamProvider.family<Map<int, ChapterJobStatus>, String>(
   (ref, itemId) async* {
-    // No backend configured → no statuses to poll.
-    if (!ref.read(configProvider).backendConfigured) {
+    // watch() so a config change (added/removed backend URL) re-evaluates
+    // this stream — otherwise the user could edit the URL in settings
+    // and the polling would still see the old "no backend" branch.
+    if (!ref.watch(configProvider).backendConfigured) {
       yield const {};
       return;
     }
@@ -99,7 +101,74 @@ final chapterStatusProvider =
   },
 );
 
-/// Tolerant parser for /api/jobs/book/{id} responses.
+/// One currently-transcribing job, as returned by /api/jobs/active.
+class ActiveJob {
+  final String jobId;
+  final String bookId;
+  final String bookTitle;
+  final int chapterIndex;
+  final String chapterTitle;
+  final double progress;
+  final int durationSeconds;
+
+  const ActiveJob({
+    required this.jobId,
+    required this.bookId,
+    required this.bookTitle,
+    required this.chapterIndex,
+    required this.chapterTitle,
+    required this.progress,
+    required this.durationSeconds,
+  });
+
+  factory ActiveJob.fromJson(Map<String, dynamic> json) => ActiveJob(
+        jobId: (json['job_id'] as String?) ?? '',
+        bookId: (json['book_id'] as String?) ?? '',
+        bookTitle: (json['book_title'] as String?) ?? 'Unknown',
+        chapterIndex: (json['chapter_index'] as num?)?.toInt() ?? 0,
+        chapterTitle: (json['chapter_title'] as String?) ?? 'Chapter',
+        progress: ((json['progress'] as num?)?.toDouble() ?? 0).clamp(0, 100),
+        durationSeconds: (json['duration_seconds'] as num?)?.toInt() ?? 0,
+      );
+}
+
+/// Polls /api/jobs/active every 5s and yields the list of jobs currently
+/// being transcribed across ALL books. Stops when the list is empty and
+/// the user navigates away (auto-dispose).
+final activeJobsProvider =
+    StreamProvider.autoDispose<List<ActiveJob>>((ref) async* {
+  if (!ref.read(configProvider).backendConfigured) {
+    yield const [];
+    return;
+  }
+  final backend = ref.read(backendClientProvider);
+  // Emit the first snapshot immediately, then on the 5s tick.
+  while (true) {
+    try {
+      final res = await backend.get('/api/jobs/active');
+      if (res.statusCode == 200 && res.data is Map) {
+        final list = (res.data['active'] as List<dynamic>? ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .map(ActiveJob.fromJson)
+            .toList();
+        yield list;
+        if (list.isEmpty) {
+          // Nothing in flight — wait longer so we don't hammer the server.
+          await Future<void>.delayed(const Duration(seconds: 10));
+          continue;
+        }
+      } else {
+        yield const [];
+      }
+    } on DioException {
+      // Transient network blip → keep the last snapshot, just wait.
+    }
+    await Future<void>.delayed(const Duration(seconds: 5));
+  }
+});
+
+
+
 /// Accepts:
 ///   [ {"chapter_index": 0, "status": "done"}, ... ]
 ///   {"jobs": [...]}

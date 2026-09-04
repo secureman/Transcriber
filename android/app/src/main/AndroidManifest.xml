@@ -3,10 +3,27 @@
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <!--
+        Lets the user whitelist the app from battery optimization (Doze),
+        which on aggressive OEMs (Xiaomi/Samsung/Huawei) will otherwise
+        pause the foreground service even though it's declared as
+        mediaPlayback. The permission is requested once via a system
+        dialog — see lib/services/battery_optimization.dart.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <!--
+        Cleartext HTTP is required because most self-hosted ABS installs
+        run on a LAN over plain http://192.168.x.x:13378. Without this,
+        cover/audio file loads fail with "CLEARTEXT communication not
+        permitted" on Android 9+. If you switch ABS to HTTPS, remove
+        this and the networkSecurityConfig.
+    -->
     <application
         android:label="EReader"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config">
         <activity
             android:name=".MainActivity"
             android:exported="true"

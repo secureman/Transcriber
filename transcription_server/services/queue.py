@@ -40,12 +40,19 @@ async def _worker() -> None:
             await asyncio.sleep(1.0)
             continue
         _inflight.add(job_id)
+        logger.info("Worker picked up job %s (in-flight: %d)",
+                    job_id, len(_inflight))
         try:
             async with job_runner.semaphore:
                 await job_runner._execute_job(job_id)
         except Exception as e:  # noqa: BLE001
+            # _execute_job already catches its own exceptions, so this only
+            # fires for truly unexpected errors (e.g. programming bugs).
             logger.exception("Unhandled error in job %s: %s", job_id, e)
-            await db.set_job_status(job_id, "error", error_message=str(e))
+            try:
+                await db.set_job_status(job_id, "error", error_message=str(e))
+            except Exception:  # noqa: BLE001
+                logger.exception("Also failed to mark job %s as errored", job_id)
         finally:
             _inflight.discard(job_id)
 
@@ -83,5 +90,9 @@ async def enqueue(job_id: str) -> None:
 async def ensure_started_on_boot() -> None:
     """Resets rows stuck in 'processing' (from a previous crash/restart)
     back to 'pending' so they get picked up again."""
-    await db.reset_stuck_processing()
+    reset = await db.reset_stuck_processing()
+    logger.info("Reset %d stuck 'processing' rows to 'pending'",
+                reset if isinstance(reset, int) else 0)
     await start_workers()
+    logger.info("Worker pool started: %d concurrent slot(s)",
+                max(1, settings.MAX_CONCURRENT_JOBS))

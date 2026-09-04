@@ -39,6 +39,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   @override
   Widget build(BuildContext context) {
     final config = ref.watch(configProvider);
+    final player = ref.watch(playerProvider);
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -76,6 +77,30 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                     child: const ReadingView(),
                   ),
                 ),
+                if (player.finished)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 24, vertical: 8),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(Icons.check_circle,
+                            color: AppColors.success, size: 18),
+                        const SizedBox(width: 8),
+                        const Text(
+                          'End of book',
+                          style: TextStyle(
+                              color: AppColors.textPrimary, fontSize: 13),
+                        ),
+                        const SizedBox(width: 16),
+                        FilledButton.tonal(
+                          onPressed: () =>
+                              ref.read(playerProvider.notifier).restart(),
+                          child: const Text('Restart'),
+                        ),
+                      ],
+                    ),
+                  ),
                 const AudioControls(),
                 const SizedBox(height: 4),
                 const ChapterScrubber(),

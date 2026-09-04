@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../core/providers/shared_prefs_provider.dart';
 import '../../core/theme/app_theme.dart';
+import '../../core/utils/battery_optimization.dart';
 import 'setup_provider.dart';
 
 class SetupScreen extends ConsumerStatefulWidget {
@@ -38,6 +40,46 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
 
     if (!mounted) return;
     if (ok) {
+      // First-run: prompt the user to whitelist us from battery
+      // optimization. This keeps the playback service alive in
+      // background on aggressive OEMs. We do it after a successful
+      // test so we only nag once setup is real.
+      final prefs = ref.read(sharedPrefsProvider);
+      if (await BatteryOptimization.shouldPrompt(prefs)) {
+        // Show a small confirmation first so the dialog doesn't come
+        // out of nowhere. The user can decline — we won't ask again.
+        final accepted = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: AppColors.surface,
+            title: const Text('Keep audio playing in background',
+                style: TextStyle(color: AppColors.textPrimary)),
+            content: const Text(
+              'Android may pause the audiobook when the app is in the '
+              'background. Whitelist EReader from battery optimization '
+              'to keep playback uninterrupted.',
+              style: TextStyle(color: AppColors.textSecondary),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('Not now'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(ctx).pop(true),
+                child: const Text('Open settings'),
+              ),
+            ],
+          ),
+        );
+        if (accepted == true) {
+          final granted = await BatteryOptimization.requestIgnore();
+          await BatteryOptimization.markAsked(prefs, granted: granted);
+        } else {
+          await BatteryOptimization.markAsked(prefs, granted: false);
+        }
+      }
+
       await Future<void>.delayed(const Duration(milliseconds: 600));
       if (mounted) context.go('/');
     }

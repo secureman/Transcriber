@@ -1,4 +1,4 @@
-import asyncio
+import logging
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -7,7 +7,13 @@ import database as db
 from models import JobStatus, TranscribeRequest
 from services import abs_client, queue
 
+logger = logging.getLogger("router.transcribe")
+
 router = APIRouter()
+
+# Priority constants. Higher = picked first by claim_job().
+PRIORITY_USER = 10   # explicit "transcribe this chapter NOW" from the user
+PRIORITY_BULK = 0    # bulk enqueue (e.g. "transcribe whole book")
 
 
 async def _ensure_book_cached(item_id: str) -> dict:
@@ -58,6 +64,12 @@ def _resolve_indices(req: TranscribeRequest,
 
 @router.post("/transcribe")
 async def transcribe(req: TranscribeRequest) -> dict:
+    logger.info(
+        "Transcribe request: item=%s mode=%s chapter_index=%s "
+        "from_chapter=%s count=%s",
+        req.abs_item_id, req.mode, req.chapter_index,
+        req.from_chapter, req.count,
+    )
     item_json = await _ensure_book_cached(req.abs_item_id)
     meta = abs_client.extract_meta(item_json)
     total = len(meta["chapters"])
@@ -65,13 +77,15 @@ async def transcribe(req: TranscribeRequest) -> dict:
         raise HTTPException(422, "Book has no chapters")
 
     indices = _resolve_indices(req, total)
+    # Explicit user requests jump the queue; full-book bulk enqueue doesn't.
+    priority = PRIORITY_USER if req.mode in ("chapter", "range") else PRIORITY_BULK
 
     enqueued: list[int] = []
     already_done: list[int] = []
     job_ids: list[str] = []
 
     for idx in indices:
-        job_id = await db.upsert_job(req.abs_item_id, idx)
+        job_id = await db.upsert_job(req.abs_item_id, idx, priority=priority)
         if job_id is None:
             already_done.append(idx)
             continue
@@ -79,12 +93,24 @@ async def transcribe(req: TranscribeRequest) -> dict:
         job_ids.append(job_id)
         await queue.enqueue(job_id)
 
+    logger.info(
+        "Transcribe enqueued: book=%s enqueued=%d already_done=%d priority=%d",
+        req.abs_item_id, len(enqueued), len(already_done), priority,
+    )
     return {
         "book_id": req.abs_item_id,
         "enqueued": enqueued,
         "already_done": already_done,
         "job_ids": job_ids,
     }
+
+
+@router.get("/jobs/active")
+async def active_jobs() -> dict:
+    """Currently-processing jobs across all books. Used by the Flutter
+    client to show "what's being transcribed right now" in the UI.
+    """
+    return {"active": await db.get_active_jobs()}
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatus)
@@ -112,6 +138,9 @@ async def book_jobs(abs_item_id: str) -> dict:
             "chapter_index": j["chapter_index"],
             "status": j["status"],
             "progress": float(j.get("progress", 0) or 0),
+            "priority": int(j.get("priority", 0) or 0),
+            "started_at": j.get("started_at"),
+            "finished_at": j.get("finished_at"),
             "error_message": j["error_message"],
             "vtt_url": (f"/api/vtt/{abs_item_id}/{j['chapter_index']}"
                         if j["status"] == "done" else None),

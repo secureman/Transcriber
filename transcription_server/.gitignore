@@ -1,1 +1,8 @@
 .env
+logs/
+*.log
+__pycache__/
+*.pyc
+transcriptions.db
+tmp_audio/
+vtt_cache/

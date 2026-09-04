@@ -1,18 +1,55 @@
 import asyncio
+import logging
 import os
+from typing import Any, Optional
 
-import groq
-from groq import AsyncGroq
+# `groq` is only needed at transcription time. Importing lazily lets the
+# server boot (and respond to /api/health, /api/jobs/active, etc.) on a
+# machine that doesn't have it installed yet — useful for first-run setup.
+try:
+    import groq
+    from groq import AsyncGroq
+    _GROQ_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    groq = None  # type: ignore[assignment]
+    AsyncGroq = None  # type: ignore[assignment,misc]
+    _GROQ_AVAILABLE = False
 
 from config import settings
 
-client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+logger = logging.getLogger("groq")
 
 MODEL = "whisper-large-v3"
 
+# Lazy client — don't construct at import time, so the server can boot
+# without a key set (useful for health checks and smoke tests).
+_client: Optional[Any] = None
+
+
+def _get_client() -> Any:
+    global _client
+    if not _GROQ_AVAILABLE:
+        raise RuntimeError(
+            "The 'groq' package is not installed. "
+            "Run: pip install groq")
+    if _client is None:
+        if not settings.GROQ_API_KEY:
+            raise RuntimeError(
+                "GROQ_API_KEY is empty — set it in .env before transcribing")
+        _client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+    return _client
+
 
 async def _create_with_retry(audio_path: str) -> list[dict]:
-    """Groq transcription with exponential-backoff rate limit retries."""
+    """Groq transcription with exponential-backoff rate limit retries.
+
+    Auth errors (bad API key) are NOT retried — fail fast so the user
+    sees a clear error instead of waiting 7s for 3 doomed attempts.
+    """
+    if not _GROQ_AVAILABLE:
+        raise RuntimeError(
+            "The 'groq' package is not installed. Run: pip install groq")
+    client = _get_client()
     for attempt in range(3):
         try:
             with open(audio_path, "rb") as f:
@@ -33,13 +70,22 @@ async def _create_with_retry(audio_path: str) -> list[dict]:
                 for w in words
                 if isinstance(w, dict) and w.get("word")
             ]
-        except groq.RateLimitError:
+        except groq.AuthenticationError as e:
+            # Don't waste 3 attempts on a bad key.
+            raise RuntimeError(
+                f"Groq rejected the API key: {e}. "
+                f"Check GROQ_API_KEY in .env") from e
+        except groq.RateLimitError as e:
+            logger.warning("Groq rate-limited (attempt %d/3): %s", attempt + 1, e)
+            if attempt == 2:
+                raise RuntimeError(f"Groq rate limit exceeded after 3 retries: {e}") from e
             await asyncio.sleep(2 ** attempt)
         except (groq.APIConnectionError, groq.InternalServerError) as e:
+            logger.warning("Groq transient error (attempt %d/3): %s", attempt + 1, e)
             if attempt == 2:
-                raise RuntimeError(f"Groq API error: {e}") from e
+                raise RuntimeError(f"Groq API error after 3 retries: {e}") from e
             await asyncio.sleep(2 ** attempt)
-    raise RuntimeError("Groq rate limit exceeded after 3 retries")
+    raise RuntimeError("Groq transcription failed (exhausted retries)")
 
 
 async def transcribe_audio(audio_path: str) -> list[dict]:

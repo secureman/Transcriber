@@ -21,6 +21,7 @@ class BookDetailScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final bookAsync = ref.watch(bookDetailProvider(itemId));
     final jobsAsync = ref.watch(chapterStatusProvider(itemId));
+    final activeJobsAsync = ref.watch(activeJobsProvider);
 
     return Scaffold(
       body: SafeArea(
@@ -38,6 +39,7 @@ class BookDetailScreen extends ConsumerWidget {
             final prefs = ref.watch(sharedPrefsProvider);
             final lastPlayed = AppConfig.lastPlayedChapter(prefs, itemId) ?? 0;
             final statuses = jobsAsync.valueOrNull ?? const {};
+            final active = activeJobsAsync.valueOrNull ?? const [];
 
             return RefreshIndicator(
               color: AppColors.primary,
@@ -45,6 +47,7 @@ class BookDetailScreen extends ConsumerWidget {
               onRefresh: () async {
                 ref.invalidate(bookDetailProvider(itemId));
                 ref.invalidate(chapterStatusProvider(itemId));
+                ref.invalidate(activeJobsProvider);
               },
               child: ListView(
                 padding: const EdgeInsets.fromLTRB(20, 8, 20, 88),
@@ -56,6 +59,10 @@ class BookDetailScreen extends ConsumerWidget {
                       onPressed: () => context.pop(),
                     ),
                   ),
+                  if (active.isNotEmpty) ...[
+                    _ActiveJobsBanner(active: active, thisBookId: itemId),
+                    const SizedBox(height: 12),
+                  ],
                   const SizedBox(height: 8),
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -179,6 +186,135 @@ class _Header extends StatelessWidget {
     );
   }
 }
+
+class _ActiveJobsBanner extends StatelessWidget {
+  final List<ActiveJob> active;
+  final String thisBookId;
+
+  const _ActiveJobsBanner({required this.active, required this.thisBookId});
+
+  @override
+  Widget build(BuildContext context) {
+    // Highlight this book's own job first, then up to 2 others.
+    final own = active.where((j) => j.bookId == thisBookId).toList();
+    final others = active.where((j) => j.bookId != thisBookId).toList();
+    final shown = [...own, ...others].take(3).toList();
+    final overflow = active.length - shown.length;
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceElevated,
+        borderRadius: BorderRadius.circular(AppColors.cardRadius),
+        border: Border.all(
+          color: AppColors.primary.withValues(alpha: 0.4),
+          width: 1,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: AppColors.primary,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Transcribing ${active.length} '
+                  '${active.length == 1 ? "chapter" : "chapters"}',
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ...shown.map((j) => _ActiveJobRow(job: j, isOwn: j.bookId == thisBookId)),
+          if (overflow > 0)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '+ $overflow more',
+                style: const TextStyle(
+                    color: AppColors.textSecondary, fontSize: 11),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ActiveJobRow extends StatelessWidget {
+  final ActiveJob job;
+  final bool isOwn;
+
+  const _ActiveJobRow({required this.job, required this.isOwn});
+
+  String _durationLabel() {
+    if (job.durationSeconds < 60) return '${job.durationSeconds}s';
+    final m = job.durationSeconds ~/ 60;
+    final s = job.durationSeconds % 60;
+    return s == 0 ? '${m}m' : '${m}m ${s}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  isOwn
+                      ? 'Ch ${job.chapterIndex + 1}: ${job.chapterTitle}'
+                      : '${job.bookTitle} — Ch ${job.chapterIndex + 1}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: isOwn ? AppColors.textPrimary : AppColors.textSecondary,
+                    fontSize: 12,
+                    fontWeight: isOwn ? FontWeight.w600 : FontWeight.w400,
+                  ),
+                ),
+              ),
+              Text(
+                '${job.progress.round()}% · ${_durationLabel()}',
+                style: const TextStyle(
+                    color: AppColors.textSecondary, fontSize: 11),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(2),
+            child: LinearProgressIndicator(
+              value: (job.progress / 100).clamp(0.0, 1.0),
+              minHeight: 3,
+              backgroundColor: AppColors.surface,
+              valueColor:
+                  const AlwaysStoppedAnimation(AppColors.primary),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 
 class _Cover extends StatelessWidget {
   final AbsItem book;

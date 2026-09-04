@@ -12,8 +12,10 @@ enum SleepTimerState { off, min30, min60, endOfChapter }
 class PlayerState {
   final String? itemId;
   final int chapterIndex;
+  final int totalChapters;
   final bool audioReady;
   final bool playing;
+  final bool finished; // true after the final chapter completes
   final Duration position;
   final Duration chapterDuration;
   final double speed;
@@ -30,8 +32,10 @@ class PlayerState {
   const PlayerState({
     this.itemId,
     this.chapterIndex = 0,
+    this.totalChapters = 0,
     this.audioReady = false,
     this.playing = false,
+    this.finished = false,
     this.position = Duration.zero,
     this.chapterDuration = Duration.zero,
     this.speed = 1.0,
@@ -48,11 +52,18 @@ class PlayerState {
 
   bool get hasVtt => vttStatus == VttStatus.ready && cues.isNotEmpty;
 
+  /// True when there's no chapter AFTER the current one — i.e. auto-advance
+  /// should NOT trigger. Returns false if totalChapters is unknown.
+  bool get isOnLastChapter =>
+      totalChapters > 0 && chapterIndex + 1 >= totalChapters;
+
   PlayerState copyWith({
     String? itemId,
     int? chapterIndex,
+    int? totalChapters,
     bool? audioReady,
     bool? playing,
+    bool? finished,
     Duration? position,
     Duration? chapterDuration,
     double? speed,
@@ -70,8 +81,10 @@ class PlayerState {
       PlayerState(
         itemId: itemId ?? this.itemId,
         chapterIndex: chapterIndex ?? this.chapterIndex,
+        totalChapters: totalChapters ?? this.totalChapters,
         audioReady: audioReady ?? this.audioReady,
         playing: playing ?? this.playing,
+        finished: finished ?? this.finished,
         position: position ?? this.position,
         chapterDuration: chapterDuration ?? this.chapterDuration,
         speed: speed ?? this.speed,
