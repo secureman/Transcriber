@@ -22,6 +22,8 @@ class PlayerController extends Notifier<PlayerState> {
   // N chapter skips you had N listeners all firing `_onChapterEnd` on
   // completion → cascading skips. Now we keep exactly one.
   StreamSubscription<ProcessingState>? _processingSub;
+  // BUG FIX: track playing state so the play/pause button reflects reality.
+  StreamSubscription<bool>? _playingSub;
   int _lastEmitMs = 0;
   int _loadedChapterIndex = -1;
 
@@ -36,16 +38,24 @@ class PlayerController extends Notifier<PlayerState> {
     _sleepTimer?.cancel();
     _positionSub?.cancel();
     _processingSub?.cancel();
+    _playingSub?.cancel();
   }
 
   /// Entry point: loads chapter audio and VTT in parallel.
   /// Audio never waits for VTT.
   Future<void> init(String itemId, int chapterIndex) async {
-    if (state.itemId == itemId && _loadedChapterIndex == chapterIndex) return;
+    // BUG FIX: added `state.audioReady` to the guard so a failed audio load
+    // doesn't permanently block retries (previously, state.itemId was set
+    // before _loadAudio ran, so the guard fired on the next init() call and
+    // the audio stayed broken forever).
+    if (state.itemId == itemId &&
+        _loadedChapterIndex == chapterIndex &&
+        state.audioReady) return;
 
     _vttPollTimer?.cancel();
     _positionSub?.cancel();
     _processingSub?.cancel();
+    _playingSub?.cancel();
     _loadedChapterIndex = chapterIndex;
 
     final prefs = ref.read(sharedPrefsProvider);
@@ -58,8 +68,17 @@ class PlayerController extends Notifier<PlayerState> {
       readingFontSize: lastSize,
     );
 
+    // BUG FIX: _loadAudio exceptions were propagating through Future.wait and
+    // getting silently swallowed by the unawaited addPostFrameCallback call.
+    // That left the player with chapterDuration=0 and audioReady=false while
+    // the VTT still showed (since _loadVtt catches its own errors). Now we
+    // catch audio errors here so the rest of the player still works and the
+    // user can at least read the transcript even if audio fails.
     await Future.wait([
-      _loadAudio(itemId, chapterIndex),
+      _loadAudio(itemId, chapterIndex).catchError((Object e) {
+        // Audio failed: keep audioReady=false so controls stay disabled.
+        // VTT loading continues unaffected.
+      }),
       _loadVtt(itemId, chapterIndex),
     ]);
 
@@ -200,11 +219,15 @@ class PlayerController extends Notifier<PlayerState> {
   }
 
   /// Parses the 202 body {"status": "processing", "progress": 0..1}.
+  ///
+  /// BUG FIX: the backend job_runner stores progress as a 0.0–1.0 float
+  /// (e.g. 0.15 for 15%), NOT a 0–100 integer. The old code divided by 100,
+  /// so 15% progress showed as 0.15% on the progress bar.
   double _progressFrom202(dynamic data) {
     if (data is Map<String, dynamic>) {
       final p = data['progress'];
       if (p is num) {
-        return (p.toDouble() / 100.0).clamp(0.0, 1.0);
+        return p.toDouble().clamp(0.0, 1.0);
       }
     }
     return 0.0;
@@ -212,6 +235,7 @@ class PlayerController extends Notifier<PlayerState> {
 
   void _startSyncListener() {
     final handler = ref.read(audioHandlerProvider);
+
     _positionSub?.cancel();
     _positionSub = handler.player.positionStream.listen((position) {
       // Throttle to ~100ms to limit provider rebuilds.
@@ -220,6 +244,14 @@ class PlayerController extends Notifier<PlayerState> {
       _lastEmitMs = nowMs;
       state = state.copyWith(position: position);
       _syncWord(position);
+    });
+
+    // BUG FIX: the old code never listened to playingStream, so state.playing
+    // was always false. The play button always showed ▶ even while the audio
+    // was playing, and the ⏸ icon never appeared.
+    _playingSub?.cancel();
+    _playingSub = handler.player.playingStream.listen((isPlaying) {
+      state = state.copyWith(playing: isPlaying);
     });
   }
 
