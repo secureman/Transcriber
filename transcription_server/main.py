@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import database as db
 from config import settings
 from routers import metadata, transcribe, vtt
-from services import queue as job_queue
+from services import ffmpeg_service, queue as job_queue
 from services.ffmpeg_service import ensure_dirs
 
 
@@ -19,8 +19,21 @@ def _configure_logging() -> None:
     Verbose INFO so the user can see what's running, ERRORs include the full
     traceback because we use logger.exception() at the call sites.
     """
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
+    log_dir = settings.LOG_DIR
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError:
+        # Termux-scoped storage can disallow creating the dir in some
+        # setups — fall back to stdout-only logging rather than refusing
+        # to start.
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        )
+        logging.getLogger("server").warning(
+            "Could not create log dir %r — logging to stdout only", log_dir
+        )
+        return
     log_path = os.path.join(log_dir, "server.log")
 
     fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -41,12 +54,38 @@ def _configure_logging() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+def _verify_writable_dirs() -> None:
+    """Fails fast with a clear message when a data dir is not writable.
+
+    On Termux, running from /storage (shared Android storage) commonly fails
+    here — SQLite cannot create its journal files there.
+    """
+    for name in ("DB_PATH", "OUTPUT_DIR", "TEMP_DIR", "LOG_DIR"):
+        path = getattr(settings, name)
+        folder = os.path.dirname(path) or "."
+        try:
+            os.makedirs(folder, exist_ok=True)
+            probe = os.path.join(folder, ".write_test")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+        except OSError as e:
+            raise RuntimeError(
+                f"{name}={path!r} is not writable ({e}). "
+                "If you are on Termux, run the server from your home "
+                "directory (not /storage) or point the *_DIR / DB_PATH "
+                "variables in .env somewhere writable."
+            ) from e
+
+
 _configure_logging()
 logger = logging.getLogger("server")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _verify_writable_dirs()
+    await ffmpeg_service.init_encoder_profile()
     await db.init_db()
     ensure_dirs()
     # Resets rows stuck in 'processing' (from a previous crash) to 'pending'
@@ -83,5 +122,8 @@ async def health() -> dict:
 if __name__ == "__main__":
     import uvicorn
 
+    # reload=False: the reloader spawns a subprocess/watcher that behaves
+    # badly on Termux (and on production hosts in general). Use
+    # `uvicorn main:app --reload` explicitly when developing on a PC.
     uvicorn.run("main:app", host=settings.HOST, port=settings.PORT,
-                reload=True)
+                reload=False)

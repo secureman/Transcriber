@@ -52,6 +52,33 @@ class AudiobookAudioHandler extends BaseAudioHandler {
     ));
   }
 
+  /// Loads a chapter from a file already downloaded to device storage
+  /// (offline playback). Same clipping semantics as [loadChapter].
+  Future<void> loadChapterFromFile({
+    required String filePath,
+    required double startSec,
+    required double endSec,
+    String? title,
+    String? artist,
+    int chapterNumber = 0,
+    int totalChapters = 0,
+  }) async {
+    final source = ClippingAudioSource(
+      child: AudioSource.uri(Uri.file(filePath)),
+      start: Duration(milliseconds: (startSec * 1000).toInt()),
+      end: Duration(milliseconds: (endSec * 1000).toInt()),
+    );
+    await player.setAudioSource(source);
+
+    mediaItem.add(MediaItem(
+      id: 'file-$chapterNumber',
+      title: title ?? 'Audiobook',
+      artist: artist,
+      album: totalChapters > 0 ? 'Chapter $chapterNumber of $totalChapters' : null,
+      duration: Duration(milliseconds: ((endSec - startSec) * 1000).toInt()),
+    ));
+  }
+
   /// Finds which audio file contains [seconds] (book timeline) and returns
   /// its ino plus the offset within that file. Works for both single-file
   /// (everything maps to file 0) and multi-file books.

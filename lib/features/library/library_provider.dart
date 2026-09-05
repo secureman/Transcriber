@@ -1,6 +1,9 @@
+import 'dart:convert';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/network/abs_client.dart';
+import '../../core/offline/offline_provider.dart';
 import '../../models/abs_item.dart';
 
 class LibraryState {
@@ -9,11 +12,15 @@ class LibraryState {
   final bool hasMore;
   final bool isLoadingMore;
 
+  /// True when [items] came from the offline downloads (server unreachable).
+  final bool servedFromCache;
+
   const LibraryState({
     this.items = const [],
     this.page = 0,
     this.hasMore = true,
     this.isLoadingMore = false,
+    this.servedFromCache = false,
   });
 
   LibraryState copyWith({
@@ -21,12 +28,14 @@ class LibraryState {
     int? page,
     bool? hasMore,
     bool? isLoadingMore,
+    bool? servedFromCache,
   }) =>
       LibraryState(
         items: items ?? this.items,
         page: page ?? this.page,
         hasMore: hasMore ?? this.hasMore,
         isLoadingMore: isLoadingMore ?? this.isLoadingMore,
+        servedFromCache: servedFromCache ?? this.servedFromCache,
       );
 }
 
@@ -35,6 +44,33 @@ class LibraryController extends AsyncNotifier<LibraryState> {
   Future<LibraryState> build() => _fetchPage(0);
 
   Future<LibraryState> _fetchPage(int page) async {
+    try {
+      return await _fetchFromServer(page);
+    } catch (e) {
+      // Server unreachable — fall back to downloaded books so the library
+      // still works offline.
+      if (page == 0) {
+        final offlineBooks =
+            ref.read(offlineStoreProvider).books.values.toList();
+        if (offlineBooks.isNotEmpty) {
+          final items = offlineBooks.map((b) {
+            return AbsItem.fromJson(
+              jsonDecode(b.itemJson) as Map<String, dynamic>,
+            );
+          }).toList();
+          return LibraryState(
+            items: items,
+            page: 0,
+            hasMore: false,
+            servedFromCache: true,
+          );
+        }
+      }
+      rethrow;
+    }
+  }
+
+  Future<LibraryState> _fetchFromServer(int page) async {
     final dio = ref.read(absClientProvider);
 
     // Pick the first library.
@@ -70,6 +106,7 @@ class LibraryController extends AsyncNotifier<LibraryState> {
       items: merged,
       page: page,
       hasMore: newItems.length >= 50,
+      servedFromCache: false,
     );
   }
 

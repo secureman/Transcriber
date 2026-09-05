@@ -46,6 +46,7 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
       // test so we only nag once setup is real.
       final prefs = ref.read(sharedPrefsProvider);
       if (await BatteryOptimization.shouldPrompt(prefs)) {
+        if (!mounted) return;
         // Show a small confirmation first so the dialog doesn't come
         // out of nowhere. The user can decline — we won't ask again.
         final accepted = await showDialog<bool>(

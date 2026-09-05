@@ -2,6 +2,7 @@ import asyncio
 import os
 
 from config import settings
+from paths import ffmpeg_path, ffprobe_path
 
 
 async def extract_chapter(audio_url: str, token: str, start: float,
@@ -12,13 +13,14 @@ async def extract_chapter(audio_url: str, token: str, start: float,
     """
     duration = max(0.0, end - start)
     cmd = [
-        "ffmpeg", "-y",
+        ffmpeg_path(), "-y",
         "-headers", f"Authorization: Bearer {token}\r\n",
         "-ss", f"{start:.3f}",
         "-t", f"{duration:.3f}",
         "-i", audio_url,
-        "-c:a", "libmp3lame",
-        "-b:a", "64k",
+        # libmp3lame is not compiled into every Android/Termux ffmpeg build;
+        # fall back to the always-available native aac encoder when needed.
+        *_audio_codec_args(),
         "-ar", "22050",
         "-ac", "1",
         output_path,
@@ -31,6 +33,39 @@ async def extract_chapter(audio_url: str, token: str, start: float,
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='ignore')[-800:]}")
+
+
+# Audio codec args. libmp3lame is missing from some ffmpeg builds (notably
+# certain Android/Termux packages), so the available encoders are probed
+# once at startup (see init_encoder_profile, called from the app lifespan)
+# and cached here. Falls back to libmp3lame until/unless the probe says
+# otherwise — every mainstream ffmpeg build for PC ships it.
+_codec_args: list[str] | None = None
+
+_MP3_ARGS = ["-c:a", "libmp3lame", "-b:a", "64k"]
+_AAC_ARGS = ["-c:a", "aac", "-b:a", "64k"]
+
+
+def _audio_codec_args() -> list[str]:
+    return _codec_args or _MP3_ARGS
+
+
+async def init_encoder_profile() -> None:
+    """Probes ffmpeg's encoders once and selects MP3 or AAC accordingly."""
+    global _codec_args
+    if _codec_args is not None:
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg_path(), "-hide_banner", "-encoders",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        listing = out.decode(errors="ignore")
+    except (OSError, FileNotFoundError):
+        listing = ""
+    _codec_args = _MP3_ARGS if "libmp3lame" in listing else _AAC_ARGS
 
 
 async def split_audio(input_path: str, chunk_duration: float,
@@ -54,12 +89,11 @@ async def split_audio(input_path: str, chunk_duration: float,
         chunk_start_with_overlap = max(0.0, start - (overlap if idx > 0 else 0))
         out_path = os.path.join(output_dir, f"chunk_{idx:03d}.mp3")
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg_path(), "-y",
             "-ss", f"{chunk_start_with_overlap:.3f}",
             "-t", f"{chunk_duration + overlap:.3f}",
             "-i", input_path,
-            "-c:a", "libmp3lame",
-            "-b:a", "64k",
+            *_audio_codec_args(),
             "-ar", "22050",
             "-ac", "1",
             out_path,
@@ -86,10 +120,9 @@ async def concat_files(parts: list[str], output_path: str) -> None:
         for p in parts:
             f.write(f"file '{os.path.abspath(p)}'\n")
     cmd = [
-        "ffmpeg", "-y",
+        ffmpeg_path(), "-y",
         "-f", "concat", "-safe", "0", "-i", list_path,
-        "-c:a", "libmp3lame",
-        "-b:a", "64k",
+        *_audio_codec_args(),
         "-ar", "22050",
         "-ac", "1",
         output_path,
@@ -111,7 +144,7 @@ async def concat_files(parts: list[str], output_path: str) -> None:
 
 async def _duration_of(path: str) -> float:
     cmd = [
-        "ffprobe", "-v", "error",
+        ffprobe_path(), "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         path,
@@ -146,3 +179,4 @@ def cleanup_tmp(path: str) -> None:
 def ensure_dirs() -> None:
     os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
     os.makedirs(settings.TEMP_DIR, exist_ok=True)
+    os.makedirs(settings.LOG_DIR, exist_ok=True)

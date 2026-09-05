@@ -1,10 +1,14 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:just_audio/just_audio.dart' hide PlayerState;
 
 import '../../core/network/abs_client.dart';
+import '../../core/network/abs_sync.dart';
 import '../../core/network/backend_client.dart';
+import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
 import '../../core/providers/read_chapters_provider.dart';
 import '../../core/providers/shared_prefs_provider.dart';
@@ -23,6 +27,19 @@ class PlayerController extends Notifier<PlayerState> {
   StreamSubscription<bool>? _playingSub;
   int _lastEmitMs = 0;
   int _loadedChapterIndex = -1;
+
+  // ── ABS progress sync ─────────────────────────────────────────────
+  String? _syncItemId;
+  String? _syncMediaId;
+  double _syncBookDuration = 0;
+  double _syncChapterStart = 0;
+  int _syncStartedAt = 0;
+  Duration _lastPosition = Duration.zero;
+  List<Map<String, dynamic>> _syncAudioTracks = const [];
+  Map<String, dynamic>? _syncLibraryItem;
+  bool _syncDisabled = false;
+  int _syncFailures = 0;
+  int _lastSyncMs = 0;
 
   // ── VTT cache helpers ──────────────────────────────────────────────
   // Keyed by "vtt_$itemId_$chapterIndex". VTTs are typically 100–400 KB;
@@ -48,6 +65,8 @@ class PlayerController extends Notifier<PlayerState> {
     _positionSub?.cancel();
     _processingSub?.cancel();
     _playingSub?.cancel();
+    // Best-effort final progress flush when leaving the player / app.
+    _syncProgress();
   }
 
   Future<void> init(String itemId, int chapterIndex) async {
@@ -55,13 +74,24 @@ class PlayerController extends Notifier<PlayerState> {
     // permanently block retries via this early-return guard.
     if (state.itemId == itemId &&
         _loadedChapterIndex == chapterIndex &&
-        state.audioReady) return;
+        state.audioReady) {
+      return;
+    }
 
     _vttPollTimer?.cancel();
     _positionSub?.cancel();
     _processingSub?.cancel();
     _playingSub?.cancel();
     _loadedChapterIndex = chapterIndex;
+
+    // Fresh ABS sync context for this book.
+    _syncItemId = itemId;
+    _syncMediaId = null;
+    _syncBookDuration = 0;
+    _syncChapterStart = 0;
+    _syncDisabled = false;
+    _syncFailures = 0;
+    _lastSyncMs = 0;
 
     final prefs = ref.read(sharedPrefsProvider);
     final lastSize = prefs.getDouble('reading_font_size') ?? 22;
@@ -88,11 +118,23 @@ class PlayerController extends Notifier<PlayerState> {
     final handler = ref.read(audioHandlerProvider);
     final abs = ref.read(absClientProvider);
 
-    final res = await abs.get('/api/items/$itemId');
-    if (res.statusCode != 200) {
-      throw Exception('Failed to load item (HTTP ${res.statusCode})');
+    // Offline first: if this book was downloaded for offline use, play the
+    // local files — no network required at all.
+    final offlineBook = ref.read(offlineStoreProvider).books[itemId];
+
+    final AbsItem item;
+    if (offlineBook != null) {
+      item = AbsItem.fromJson(
+        jsonDecode(offlineBook.itemJson) as Map<String, dynamic>,
+      );
+    } else {
+      final res = await abs.get('/api/items/$itemId');
+      if (res.statusCode != 200) {
+        throw Exception('Failed to load item (HTTP ${res.statusCode})');
+      }
+      item = AbsItem.fromJson(res.data as Map<String, dynamic>);
     }
-    final item = AbsItem.fromJson(res.data as Map<String, dynamic>);
+
     final isArabic =
         item.isArabic || (item.language?.toLowerCase().startsWith('ar') ?? false);
 
@@ -112,18 +154,71 @@ class PlayerController extends Notifier<PlayerState> {
       seconds: chapter.start,
     );
 
-    await handler.loadChapter(
-      absUrl: config.absUrl,
-      token: config.absToken,
-      itemId: itemId,
-      fileIno: ino,
-      startSec: offsetInFile,
-      endSec: offsetInFile + chapter.duration,
-      title: item.title,
-      artist: item.author.isEmpty ? null : item.author,
-      chapterNumber: chIndex + 1,
-      totalChapters: totalChapters,
-    );
+    final title = item.title;
+    final artist = item.author.isEmpty ? null : item.author;
+    final chapterNumber = chIndex + 1;
+
+    // Record everything the ABS progress syncer needs for this book so it can
+    // report a position on the whole-book timeline.
+    _syncMediaId = item.mediaId.isEmpty ? null : item.mediaId;
+    _syncBookDuration = item.duration;
+    _syncChapterStart = chapter.start;
+    _syncStartedAt = DateTime.now().millisecondsSinceEpoch;
+    _syncAudioTracks = [
+      for (var i = 0; i < item.audioFiles.length; i++)
+        buildAudioTrack(
+          index: i,
+          filename: item.audioFiles[i].filename,
+          url: '${config.absUrl}/api/items/$itemId/file/${item.audioFiles[i].ino}',
+        ),
+    ];
+    _syncLibraryItem = buildMinifiedLibraryItem(item);
+
+    if (offlineBook != null) {
+      final audioFile = item.audioFiles.firstWhere(
+        (f) => f.ino == ino,
+        orElse: () => item.audioFiles.first,
+      );
+      // Same naming scheme as the downloader (see AbsAudioFile.offlineFilename)
+      // so a downloaded book is always found on disk for offline playback.
+      final filePath = '${offlineBook.dirPath}/${audioFile.offlineFilename}';
+      if (!await File(filePath).exists()) {
+        // Safety net for chapter-level downloads: this file wasn't fetched
+        // yet — grab just this one from ABS so playback always works.
+        try {
+          await ref
+              .read(offlineStoreProvider.notifier)
+              .downloadChapter(itemId, ino);
+        } catch (_) {
+          throw Exception('Audio file not on device and download failed');
+        }
+        if (!await File(filePath).exists()) {
+          throw Exception('Local audio file missing: $filePath');
+        }
+      }
+      await handler.loadChapterFromFile(
+        filePath: filePath,
+        startSec: offsetInFile,
+        endSec: offsetInFile + chapter.duration,
+        title: title,
+        artist: artist,
+        chapterNumber: chapterNumber,
+        totalChapters: totalChapters,
+      );
+    } else {
+      await handler.loadChapter(
+        absUrl: config.absUrl,
+        token: config.absToken,
+        itemId: itemId,
+        fileIno: ino,
+        startSec: offsetInFile,
+        endSec: offsetInFile + chapter.duration,
+        title: title,
+        artist: artist,
+        chapterNumber: chapterNumber,
+        totalChapters: totalChapters,
+      );
+    }
 
     state = state.copyWith(
       isArabic: isArabic,
@@ -271,8 +366,10 @@ class PlayerController extends Notifier<PlayerState> {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (nowMs - _lastEmitMs < 90) return;
       _lastEmitMs = nowMs;
+      _lastPosition = position;
       state = state.copyWith(position: position);
       _syncWord(position);
+      _driftSync();
     });
 
     // BUG FIX v1: was never listening to playingStream.
@@ -299,18 +396,88 @@ class PlayerController extends Notifier<PlayerState> {
     }
   }
 
+  // ── ABS progress sync ──────────────────────────────────────────────
+
+  /// Throttled rolling sync — fires at most once per 10s while playing so we
+  /// don't hammer the server, but still keeps ABS up to date.
+  void _driftSync() {
+    if (_syncDisabled) return;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastSyncMs < 10000) return;
+    _lastSyncMs = nowMs;
+    _syncProgress();
+  }
+
+  /// Reports the current book-timeline position to Audiobookshelf.
+  void _syncProgress({bool isFinished = false}) {
+    if (_syncDisabled) return;
+    final itemId = _syncItemId;
+    final mediaId = _syncMediaId;
+    if (itemId == null || mediaId == null || mediaId.isEmpty) return;
+    final duration = _syncBookDuration;
+    if (duration <= 0 || _syncLibraryItem == null) return;
+
+    // Player position is inside the chapter clip; chapter.start is the
+    // chapter's offset on the whole-book timeline.
+    final currentTime =
+        (_syncChapterStart + _lastPosition.inMilliseconds / 1000.0)
+            .clamp(0.0, duration);
+
+    unawaited(
+      ref
+          .read(progressSyncProvider)
+          .reportProgress(
+            itemId: itemId,
+            mediaId: mediaId,
+            durationSec: duration,
+            currentTimeSec: currentTime,
+            isFinished: isFinished,
+            startedAt: _syncStartedAt,
+            finishedAt: isFinished
+                ? DateTime.now().millisecondsSinceEpoch
+                : null,
+            audioTracks: _syncAudioTracks,
+            libraryItem: _syncLibraryItem,
+          )
+          .then((accepted) {
+            if (accepted) {
+              _syncFailures = 0;
+              return;
+            }
+            // Two consecutive failures (offline, bad token, unsupported ABS)
+            // → stop trying until the next book is opened.
+            _syncFailures++;
+            if (_syncFailures >= 2) {
+              _syncDisabled = true;
+              _syncFailures = 0;
+            }
+            _lastSyncMs = 0; // retry on next tick instead of waiting 10s
+          }),
+    );
+  }
+
   // ── Playback controls ──────────────────────────────────────────────
 
   Future<void> togglePlayPause() async {
     final handler = ref.read(audioHandlerProvider);
     if (handler.player.playing) {
       await handler.pause();
+      // Flush progress immediately on pause so ABS sees where we stopped.
+      _lastSyncMs = 0;
+      _syncProgress();
     } else {
+      if (_syncStartedAt == 0) {
+        _syncStartedAt = DateTime.now().millisecondsSinceEpoch;
+      }
       await handler.play();
     }
   }
 
-  Future<void> seekTo(Duration d) => ref.read(audioHandlerProvider).seek(d);
+  Future<void> seekTo(Duration d) {
+    // A manual seek changed the position — sync it on the next tick.
+    _lastSyncMs = 0;
+    return ref.read(audioHandlerProvider).seek(d);
+  }
   Future<void> skipForward15() => ref.read(audioHandlerProvider).skipForward15();
   Future<void> skipBackward15() => ref.read(audioHandlerProvider).skipBackward15();
 
@@ -329,6 +496,9 @@ class PlayerController extends Notifier<PlayerState> {
   Future<void> switchChapter(int newIndex) async {
     final itemId = state.itemId;
     if (itemId == null) return;
+    // Persist where the previous chapter left off.
+    _lastSyncMs = 0;
+    _syncProgress();
     _vttPollTimer?.cancel();
     state = const PlayerState();
     _loadedChapterIndex = -1;
@@ -353,10 +523,14 @@ class PlayerController extends Notifier<PlayerState> {
     }
 
     if (state.sleepTimer == SleepTimerState.endOfChapter) {
+      _lastSyncMs = 0;
+      _syncProgress();
       setSleepTimer(SleepTimerState.off);
       return;
     }
     if (state.isOnLastChapter) {
+      // Mark the whole book as finished in ABS too.
+      _syncProgress(isFinished: true);
       state = state.copyWith(playing: false, finished: true);
       return;
     }
@@ -376,6 +550,8 @@ class PlayerController extends Notifier<PlayerState> {
             : const Duration(minutes: 60),
         () async {
           await ref.read(audioHandlerProvider).pause();
+          _lastSyncMs = 0;
+          _syncProgress();
           state = state.copyWith(sleepTimer: SleepTimerState.off);
         },
       );

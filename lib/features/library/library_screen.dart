@@ -50,32 +50,67 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen> {
             );
           }
 
-          return RefreshIndicator(
-            color: AppColors.primary,
-            backgroundColor: AppColors.surface,
-            onRefresh: () =>
-                ref.read(libraryItemsProvider.notifier).refresh(),
-            child: NotificationListener<ScrollNotification>(
-              onNotification: (n) {
-                if (n.metrics.pixels >= n.metrics.maxScrollExtent - 400) {
-                  ref.read(libraryItemsProvider.notifier).loadMore();
-                }
-                return false;
-              },
-              child: GridView.builder(
-                padding: const EdgeInsets.all(16),
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 2,
-                  mainAxisSpacing: 20,
-                  crossAxisSpacing: 16,
-                  // Taller than wide: cover + title + author + progress.
-                  childAspectRatio: 0.52,
+          return Column(
+            children: [
+              if (state.servedFromCache) ...[
+                _OfflineBanner(
+                  onRetry: () =>
+                      ref.read(libraryItemsProvider.notifier).refresh(),
                 ),
-                itemCount: state.items.length,
-                itemBuilder: (context, index) =>
-                    BookCard(item: state.items[index]),
+                const SizedBox(height: 8),
+              ],
+              Expanded(
+                child: RefreshIndicator(
+                  color: AppColors.primary,
+                  backgroundColor: AppColors.surface,
+                  onRefresh: () =>
+                      ref.read(libraryItemsProvider.notifier).refresh(),
+                  child: NotificationListener<ScrollNotification>(
+                    onNotification: (n) {
+                      if (n.metrics.pixels >=
+                          n.metrics.maxScrollExtent - 400) {
+                        ref.read(libraryItemsProvider.notifier).loadMore();
+                      }
+                      return false;
+                    },
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        // Responsive grid: more columns + flatter cards on
+                        // wide screens so nothing ever overflows.
+                        final width = constraints.maxWidth;
+                        final crossAxisCount = width >= 1100
+                            ? 5
+                            : width >= 700
+                                ? 3
+                                : 2;
+                        const spacing = 16.0;
+                        const padding = 32.0;
+                        final itemWidth =
+                            (width - padding - spacing * (crossAxisCount - 1)) /
+                                crossAxisCount;
+                        // Cover (≈ width × 1.32) + text block (~66px).
+                        final childAspectRatio =
+                            itemWidth / (itemWidth * 1.32 + 66);
+
+                        return GridView.builder(
+                          padding: const EdgeInsets.all(16),
+                          gridDelegate:
+                              SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: crossAxisCount,
+                            mainAxisSpacing: 20,
+                            crossAxisSpacing: spacing,
+                            childAspectRatio: childAspectRatio,
+                          ),
+                          itemCount: state.items.length,
+                          itemBuilder: (context, index) =>
+                              BookCard(item: state.items[index]),
+                        );
+                      },
+                    ),
+                  ),
+                ),
               ),
-            ),
+            ],
           );
         },
       ),
@@ -87,6 +122,45 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen> {
       context: context,
       delegate: _BookSearchDelegate(
         items: ref.read(libraryItemsProvider).valueOrNull?.items ?? const [],
+      ),
+    );
+  }
+}
+
+class _OfflineBanner extends StatelessWidget {
+  final VoidCallback onRetry;
+
+  const _OfflineBanner({required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceElevated,
+        borderRadius: BorderRadius.circular(AppColors.cardRadius),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.wifi_off_rounded,
+              color: AppColors.textSecondary, size: 16),
+          const SizedBox(width: 8),
+          const Expanded(
+            child: Text(
+              'Server unreachable · showing downloaded books',
+              style:
+                  TextStyle(color: AppColors.textSecondary, fontSize: 12),
+            ),
+          ),
+          TextButton(
+            onPressed: onRetry,
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+            ),
+            child: const Text('Retry'),
+          ),
+        ],
       ),
     );
   }

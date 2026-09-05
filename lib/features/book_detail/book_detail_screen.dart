@@ -1,15 +1,17 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
 import '../../core/providers/shared_prefs_provider.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/utils/duration_ext.dart';
+import '../../core/widgets/cover_image.dart';
 import '../../models/abs_item.dart';
 import 'book_detail_provider.dart';
 import 'widgets/chapter_list_tile.dart';
+import 'widgets/download_control.dart';
 import 'widgets/transcribe_sheet.dart';
 
 class BookDetailScreen extends ConsumerWidget {
@@ -64,13 +66,29 @@ class BookDetailScreen extends ConsumerWidget {
                     const SizedBox(height: 12),
                   ],
                   const SizedBox(height: 8),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      _Cover(book: book, config: config),
-                      const SizedBox(width: 16),
-                      Expanded(child: _Header(book: book)),
-                    ],
+                  // Cover + header: stacked on very narrow screens,
+                  // side-by-side everywhere else.
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final narrow = constraints.maxWidth < 340;
+                      if (narrow) {
+                        return Column(
+                          children: [
+                            _Cover(book: book, config: config),
+                            const SizedBox(height: 16),
+                            _Header(book: book, centered: true),
+                          ],
+                        );
+                      }
+                      return Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _Cover(book: book, config: config),
+                          const SizedBox(width: 16),
+                          Expanded(child: _Header(book: book)),
+                        ],
+                      );
+                    },
                   ),
                   const SizedBox(height: 24),
                   FilledButton.icon(
@@ -80,6 +98,11 @@ class BookDetailScreen extends ConsumerWidget {
                     ),
                     icon: const Icon(Icons.play_arrow_rounded, size: 26),
                     label: const Text('READ ALONG'),
+                  ),
+                  const SizedBox(height: 12),
+                  DownloadControl(
+                    itemId: itemId,
+                    totalFileCount: book.audioFiles.length,
                   ),
                   const SizedBox(height: 28),
                   const Text(
@@ -98,6 +121,7 @@ class BookDetailScreen extends ConsumerWidget {
                       chapter: ch,
                       index: i,
                       job: statuses[i],
+                      audioIno: book.fileInoForChapter(i),
                       onTap: () => context.push('/player/$itemId/$i'),
                     );
                   }),
@@ -157,16 +181,22 @@ class BookDetailScreen extends ConsumerWidget {
 
 class _Header extends StatelessWidget {
   final AbsItem book;
+  final bool centered;
 
-  const _Header({required this.book});
+  const _Header({required this.book, this.centered = false});
 
   @override
   Widget build(BuildContext context) {
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: centered
+          ? CrossAxisAlignment.center
+          : CrossAxisAlignment.start,
       children: [
         Text(
           book.title,
+          textAlign: centered ? TextAlign.center : TextAlign.start,
+          maxLines: 4,
+          overflow: TextOverflow.ellipsis,
           style: const TextStyle(
             color: AppColors.textPrimary,
             fontSize: 18,
@@ -176,6 +206,9 @@ class _Header extends StatelessWidget {
         const SizedBox(height: 6),
         Text(
           book.author,
+          textAlign: centered ? TextAlign.center : TextAlign.start,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
           style: const TextStyle(color: AppColors.textSecondary, fontSize: 14),
         ),
         const SizedBox(height: 6),
@@ -317,15 +350,16 @@ class _ActiveJobRow extends StatelessWidget {
 }
 
 
-class _Cover extends StatelessWidget {
+class _Cover extends ConsumerWidget {
   final AbsItem book;
   final AppConfig config;
 
   const _Cover({required this.book, required this.config});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final url = book.coverUrl(config.absUrl);
+    final offlineBook = ref.watch(offlineStoreProvider).books[book.id];
     return Container(
       width: 120,
       height: 180,
@@ -336,24 +370,12 @@ class _Cover extends StatelessWidget {
               color: Colors.black54, blurRadius: 12, offset: Offset(0, 6)),
         ],
       ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(AppColors.cardRadius),
-        child: url.isEmpty
-            ? Container(
-                color: AppColors.surface,
-                child: const Icon(Icons.menu_book_rounded,
-                    color: AppColors.surfaceElevated, size: 40),
-              )
-            : CachedNetworkImage(
-                imageUrl: url,
-                httpHeaders: {'Authorization': 'Bearer ${config.absToken}'},
-                fit: BoxFit.cover,
-                errorWidget: (_, _, _) => Container(
-                  color: AppColors.surface,
-                  child: const Icon(Icons.menu_book_rounded,
-                      color: AppColors.surfaceElevated, size: 40),
-                ),
-              ),
+      child: CoverImage(
+        url: url,
+        localPath: offlineBook?.coverPath,
+        httpHeaders: {'Authorization': 'Bearer ${config.absToken}'},
+        radius: AppColors.cardRadius,
+        iconSize: 40,
       ),
     );
   }

@@ -10,7 +10,7 @@ from config import settings
 
 logger = logging.getLogger("database")
 
-DB_PATH = "transcriptions.db"
+DB_PATH = settings.DB_PATH
 
 # Module-level lock serializes all writes (aiosqlite is single-connection;
 # this makes claim/upsert/status atomic).

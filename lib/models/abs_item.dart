@@ -26,21 +26,46 @@ class AbsAudioFile {
   final double duration;
   final String filename;
 
+  /// Lowercase file extension WITHOUT the leading dot (e.g. "mp3", "m4b").
+  /// Falls back to "mp3" when unknown.
+  final String ext;
+
   const AbsAudioFile({
     required this.ino,
     required this.duration,
     required this.filename,
+    this.ext = 'mp3',
   });
 
-  factory AbsAudioFile.fromJson(Map<String, dynamic> json) => AbsAudioFile(
-        ino: (json['ino'] as String?) ?? '',
-        duration: (json['duration'] as num?)?.toDouble() ?? 0,
-        filename: (json['filename'] as String?) ?? '',
-      );
+  factory AbsAudioFile.fromJson(Map<String, dynamic> json) {
+    // In ABS item JSON, the display filename + ext live nested under
+    // `metadata`, not at the top level:
+    //   "ino": "1329732",
+    //   "metadata": { "filename": "...", "ext": ".mp3", ... }
+    final metadata = json['metadata'] as Map<String, dynamic>? ?? const {};
+    final rawExt = metadata['ext'] as String? ?? '';
+    // `ino` may come back as a number or a string depending on ABS version.
+    final rawIno = json['ino'];
+    return AbsAudioFile(
+      ino: rawIno == null ? '' : rawIno.toString(),
+      duration: (json['duration'] as num?)?.toDouble() ?? 0,
+      filename: (metadata['filename'] as String?) ?? '',
+      ext: rawExt.startsWith('.')
+          ? rawExt.substring(1).toLowerCase()
+          : rawExt.toLowerCase(),
+    );
+  }
+
+  /// The filename used when this audio file is saved to disk for offline use.
+  /// Kept identical between the downloader and the offline player so the
+  /// saved file is always found on playback.
+  String get offlineFilename =>
+      'audio_$ino.${ext.isEmpty ? 'mp3' : ext}';
 }
 
 class AbsItem {
   final String id;
+  final String mediaId; // e.g. "li_..." — used for ABS progress sync
   final String title;
   final String author;
   final double duration; // total seconds
@@ -58,6 +83,7 @@ class AbsItem {
     required this.duration,
     required this.chapters,
     required this.audioFiles,
+    this.mediaId = '',
     this.seriesName,
     this.language,
     this.coverPath = '',
@@ -75,6 +101,23 @@ class AbsItem {
   String coverUrl(String absUrl) {
     if (coverPath.startsWith('http')) return coverPath;
     return '$absUrl/api/items/$id/cover';
+  }
+
+  /// The audio file (by ino) that contains the start of [chapterIndex].
+  /// Mirrors AudiobookAudioHandler.resolveFilePosition. Returns '' when the
+  /// mapping can't be made (no chapters/files or index out of range).
+  String fileInoForChapter(int chapterIndex) {
+    if (chapters.isEmpty || audioFiles.isEmpty) return '';
+    if (chapterIndex < 0 || chapterIndex >= chapters.length) return '';
+    final start = chapters[chapterIndex].start;
+    var cursor = 0.0;
+    for (final f in audioFiles) {
+      if (start < cursor + f.duration || identical(f, audioFiles.last)) {
+        return f.ino;
+      }
+      cursor += f.duration;
+    }
+    return audioFiles.last.ino;
   }
 
   factory AbsItem.fromJson(Map<String, dynamic> json) {
@@ -96,6 +139,7 @@ class AbsItem {
 
     return AbsItem(
       id: (json['id'] as String?) ?? '',
+      mediaId: (media['id'] as String?) ?? '',
       title: (metadata['title'] as String?) ?? (json['name'] as String?) ?? 'Unknown',
       author: (metadata['authorName'] as String?) ?? '',
       duration: (media['duration'] as num?)?.toDouble() ?? 0,

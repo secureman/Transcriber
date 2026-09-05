@@ -1,10 +1,11 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../../core/offline/offline_provider.dart';
 import '../../../core/providers/config_provider.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../core/widgets/cover_image.dart';
 import '../../../models/abs_item.dart';
 
 class BookCard extends ConsumerWidget {
@@ -15,6 +16,7 @@ class BookCard extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final config = ref.watch(configProvider);
+    final offlineBook = ref.watch(offlineStoreProvider).books[item.id];
     final coverUrl = item.coverUrl(config.absUrl);
 
     return GestureDetector(
@@ -34,26 +36,36 @@ class BookCard extends ConsumerWidget {
                   ),
                 ],
               ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(AppColors.cardRadius),
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    coverUrl.isEmpty
-                        ? _coverPlaceholder()
-                        : CachedNetworkImage(
-                            imageUrl: coverUrl,
-                            httpHeaders: {
-                              'Authorization': 'Bearer ${config.absToken}',
-                            },
-                            fit: BoxFit.cover,
-                            placeholder: (_, _) =>
-                                _coverPlaceholder(),
-                            errorWidget: (_, _, _) =>
-                                _coverPlaceholder(),
-                          ),
-                  ],
-                ),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  CoverImage(
+                    url: coverUrl,
+                    localPath: offlineBook?.coverPath,
+                    httpHeaders: {
+                      'Authorization': 'Bearer ${config.absToken}',
+                    },
+                    placeholder: _coverPlaceholder(),
+                    iconSize: 40,
+                  ),
+                  if (offlineBook != null)
+                    Positioned(
+                      top: 8,
+                      right: 8,
+                      child: Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.6),
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(
+                          Icons.offline_pin_rounded,
+                          size: 14,
+                          color: AppColors.primary,
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
           ),

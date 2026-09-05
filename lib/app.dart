@@ -7,6 +7,7 @@ import 'core/theme/app_theme.dart';
 import 'features/book_detail/book_detail_screen.dart';
 import 'features/library/library_screen.dart';
 import 'features/player/player_screen.dart';
+import 'features/player/widgets/mini_player_bar.dart';
 import 'features/settings/settings_screen.dart';
 import 'features/setup/setup_screen.dart';
 
@@ -26,24 +27,33 @@ final routerProvider = Provider<GoRouter>((ref) {
       return null;
     },
     routes: [
+      // Outside the shell: full-screen setup flow.
       GoRoute(
         path: '/setup',
         builder: (context, state) => const SetupScreen(),
       ),
-      GoRoute(
-        path: '/',
-        builder: (context, state) => const LibraryScreen(),
+      // Shell screens (library / book detail / settings) share the bottom
+      // mini player bar, so playback continues after leaving the player.
+      ShellRoute(
+        builder: (context, state, child) => AppShell(child: child),
+        routes: [
+          GoRoute(
+            path: '/',
+            builder: (context, state) => const LibraryScreen(),
+          ),
+          GoRoute(
+            path: '/book/:id',
+            builder: (context, state) => BookDetailScreen(
+              itemId: state.pathParameters['id']!,
+            ),
+          ),
+          GoRoute(
+            path: '/settings',
+            builder: (context, state) => const SettingsScreen(),
+          ),
+        ],
       ),
-      GoRoute(
-        path: '/book/:id',
-        builder: (context, state) => BookDetailScreen(
-          itemId: state.pathParameters['id']!,
-        ),
-      ),
-      GoRoute(
-        path: '/settings',
-        builder: (context, state) => const SettingsScreen(),
-      ),
+      // Outside the shell: the full-screen player replaces everything.
       GoRoute(
         path: '/player/:id/:chapterIndex',
         builder: (context, state) => PlayerScreen(
@@ -54,6 +64,25 @@ final routerProvider = Provider<GoRouter>((ref) {
     ],
   );
 });
+
+/// Wraps the shell screens with the persistent mini player bar at the bottom.
+class AppShell extends StatelessWidget {
+  final Widget child;
+
+  const AppShell({super.key, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Column(
+        children: [
+          Expanded(child: child),
+          const MiniPlayerBar(),
+        ],
+      ),
+    );
+  }
+}
 
 class EReaderApp extends ConsumerWidget {
   const EReaderApp({super.key});

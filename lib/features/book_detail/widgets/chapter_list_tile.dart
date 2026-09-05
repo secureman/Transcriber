@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/offline/offline_provider.dart';
 import '../../../core/providers/read_chapters_provider.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/duration_ext.dart';
@@ -14,6 +15,10 @@ class ChapterListTile extends ConsumerWidget {
   final ChapterJobStatus? job;
   final VoidCallback onTap;
 
+  /// ino of the audio file containing this chapter (single file for
+  /// single-file books). Empty when the book metadata has no mapping.
+  final String audioIno;
+
   const ChapterListTile({
     super.key,
     required this.itemId,
@@ -21,12 +26,27 @@ class ChapterListTile extends ConsumerWidget {
     required this.index,
     required this.job,
     required this.onTap,
+    this.audioIno = '',
   });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final listenedSet = ref.watch(readChaptersProvider);
     final isListened = listenedSet.contains('$itemId/$index');
+
+    // Per-chapter download state. Only shown for multi-file books where a
+    // chapter maps 1:1 to its own file; single-file books download as a
+    // whole from the main control.
+    final store = ref.watch(offlineStoreProvider);
+    final isMultiFile = store.bookFor(itemId) != null && audioIno.isNotEmpty;
+    final dl = store.downloads[itemId];
+    final chapterDownloaded = isMultiFile
+        ? store.isChapterDownloaded(itemId, audioIno)
+        : false;
+    final chapterInFlight = isMultiFile &&
+        dl != null &&
+        dl.isRunning &&
+        dl.currentIno == audioIno;
 
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
@@ -69,9 +89,76 @@ class ChapterListTile extends ConsumerWidget {
           ],
         ),
       ),
-      trailing: Text(
-        chapter.duration.asDuration.mmss,
-        style: const TextStyle(color: AppColors.textSecondary, fontSize: 13),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (isMultiFile) ...[
+            _ChapterDownloadBadge(
+              downloaded: chapterDownloaded,
+              inFlight: chapterInFlight,
+              onTap: chapterInFlight || chapterDownloaded
+                  ? null
+                  : () =>
+                      ref
+                          .read(offlineStoreProvider.notifier)
+                          .downloadChapter(itemId, audioIno),
+            ),
+            const SizedBox(width: 8),
+          ],
+          Text(
+            chapter.duration.asDuration.mmss,
+            style: const TextStyle(color: AppColors.textSecondary, fontSize: 13),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Small circular indicator / download button at the end of a chapter row.
+class _ChapterDownloadBadge extends StatelessWidget {
+  final bool downloaded;
+  final bool inFlight;
+  final VoidCallback? onTap;
+
+  const _ChapterDownloadBadge({
+    required this.downloaded,
+    required this.inFlight,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (inFlight) {
+      return const SizedBox(
+        width: 22,
+        height: 22,
+        child: Padding(
+          padding: EdgeInsets.all(3),
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            color: AppColors.primary,
+          ),
+        ),
+      );
+    }
+    if (downloaded) {
+      return const Icon(Icons.download_done_rounded,
+          size: 22, color: AppColors.success);
+    }
+    return SizedBox(
+      width: 22,
+      height: 22,
+      child: IconButton(
+        padding: EdgeInsets.zero,
+        iconSize: 20,
+        splashRadius: 16,
+        onPressed: onTap,
+        icon: const Icon(
+          Icons.download_rounded,
+          size: 20,
+          color: AppColors.textSecondary,
+        ),
       ),
     );
   }

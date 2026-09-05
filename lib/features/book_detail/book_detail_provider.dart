@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/network/abs_client.dart';
 import '../../core/network/backend_client.dart';
+import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
 import '../../models/abs_item.dart';
 
@@ -61,11 +63,24 @@ final bookDetailProvider =
     // fall through to direct ABS fetch
   }
 
-  final absRes = await abs.get('/api/items/$itemId');
-  if (absRes.statusCode != 200) {
-    throw Exception('Failed to load book (HTTP ${absRes.statusCode})');
+  try {
+    final absRes = await abs.get('/api/items/$itemId');
+    if (absRes.statusCode == 200) {
+      return AbsItem.fromJson(absRes.data as Map<String, dynamic>);
+    }
+  } on DioException {
+    // fall through to offline cache
   }
-  return AbsItem.fromJson(absRes.data as Map<String, dynamic>);
+
+  // Server unreachable — serve the downloaded copy if we have one.
+  final offlineBook = ref.watch(offlineStoreProvider).books[itemId];
+  if (offlineBook != null) {
+    return AbsItem.fromJson(
+      jsonDecode(offlineBook.itemJson) as Map<String, dynamic>,
+    );
+  }
+
+  throw Exception('Failed to load book — server unreachable and not downloaded');
 });
 
 /// Polls transcription job statuses for a book every 4 seconds.

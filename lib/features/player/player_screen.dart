@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -5,9 +6,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
 import '../../core/providers/reader_theme_provider.dart';
 import '../../core/theme/app_theme.dart';
+import '../../core/widgets/cover_image.dart';
 import 'player_provider.dart';
 import 'player_state.dart';
 import 'widgets/audio_controls.dart';
@@ -67,57 +70,70 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           ),
           // 3. Foreground content.
           SafeArea(
-            child: Column(
-              children: [
-                const _AppBar(),
-                _HeaderInfo(itemId: widget.itemId, config: config),
-                Expanded(
-                  child: Consumer(
-                    builder: (_, ref, __) {
-                      final t = ReaderThemeData.all[
-                          ref.watch(readerThemeProvider)]!;
-                      return Container(
-                        margin: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-                        clipBehavior: Clip.antiAlias,
-                        decoration: BoxDecoration(
-                          color: t.background,
-                          borderRadius:
-                              BorderRadius.circular(AppColors.cardRadius),
-                        ),
-                        child: const ReadingView(),
-                      );
-                    },
-                  ),
-                ),
-                if (player.finished)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 24, vertical: 8),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const Icon(Icons.check_circle,
-                            color: AppColors.success, size: 18),
-                        const SizedBox(width: 8),
-                        const Text(
-                          'End of book',
-                          style: TextStyle(
-                              color: AppColors.textPrimary, fontSize: 13),
-                        ),
-                        const SizedBox(width: 16),
-                        FilledButton.tonal(
-                          onPressed: () =>
-                              ref.read(playerProvider.notifier).restart(),
-                          child: const Text('Restart'),
-                        ),
-                      ],
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // Compact mode on short screens (landscape / small phones):
+                // collapse the header so the reading card always fits.
+                final compact = constraints.maxHeight < 620;
+                return Column(
+                  children: [
+                    const _AppBar(),
+                    _HeaderInfo(
+                      itemId: widget.itemId,
+                      config: config,
+                      compact: compact,
                     ),
-                  ),
-                const AudioControls(),
-                const SizedBox(height: 4),
-                const ChapterScrubber(),
-                const SizedBox(height: 16),
-              ],
+                    Expanded(
+                      child: Consumer(
+                        builder: (_, ref, _) {
+                          final t = ReaderThemeData.all[
+                              ref.watch(readerThemeProvider)]!;
+                          return Container(
+                            margin: compact
+                                ? const EdgeInsets.fromLTRB(12, 4, 12, 4)
+                                : const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                            clipBehavior: Clip.antiAlias,
+                            decoration: BoxDecoration(
+                              color: t.background,
+                              borderRadius: BorderRadius.circular(
+                                  AppColors.cardRadius),
+                            ),
+                            child: const ReadingView(),
+                          );
+                        },
+                      ),
+                    ),
+                    if (player.finished)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 24, vertical: 8),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const Icon(Icons.check_circle,
+                                color: AppColors.success, size: 18),
+                            const SizedBox(width: 8),
+                            const Text(
+                              'End of book',
+                              style: TextStyle(
+                                  color: AppColors.textPrimary, fontSize: 13),
+                            ),
+                            const SizedBox(width: 16),
+                            FilledButton.tonal(
+                              onPressed: () =>
+                                  ref.read(playerProvider.notifier).restart(),
+                              child: const Text('Restart'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    const AudioControls(),
+                    const SizedBox(height: 4),
+                    const ChapterScrubber(),
+                    SizedBox(height: compact ? 8 : 16),
+                  ],
+                );
+              },
             ),
           ),
         ],
@@ -135,21 +151,25 @@ class _BackgroundCover extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final meta = ref.watch(bookMetaProvider(itemId)).valueOrNull;
+    final offlineBook = ref.watch(offlineStoreProvider).books[itemId];
     final url = meta?.coverUrl(config.absUrl) ?? '';
-    if (url.isEmpty) {
-      return Container(color: AppColors.background);
+
+    ImageProvider? provider;
+    final localCover = offlineBook?.coverPath;
+    if (localCover != null && File(localCover).existsSync()) {
+      provider = FileImage(File(localCover));
+    } else if (url.isNotEmpty) {
+      provider = CachedNetworkImageProvider(
+        url,
+        headers: {'Authorization': 'Bearer ${config.absToken}'},
+      );
     }
+    if (provider == null) return Container(color: AppColors.background);
     return Opacity(
       opacity: 0.15,
-      child: CachedNetworkImage(
-        imageUrl: url,
-        httpHeaders: {'Authorization': 'Bearer ${config.absToken}'},
-        fit: BoxFit.cover,
-        imageBuilder: (context, imageProvider) => ImageFiltered(
-          imageFilter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
-          child: Image(image: imageProvider, fit: BoxFit.cover),
-        ),
-        errorWidget: (_, _, _) => Container(color: AppColors.background),
+      child: ImageFiltered(
+        imageFilter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+        child: Image(image: provider, fit: BoxFit.cover),
       ),
     );
   }
@@ -381,13 +401,71 @@ class _QuickThemeButton extends ConsumerWidget {
 class _HeaderInfo extends ConsumerWidget {
   final String itemId;
   final AppConfig config;
+  final bool compact;
 
-  const _HeaderInfo({required this.itemId, required this.config});
+  const _HeaderInfo({
+    required this.itemId,
+    required this.config,
+    this.compact = false,
+  });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final meta = ref.watch(bookMetaProvider(itemId)).valueOrNull;
+    final offlineBook = ref.watch(offlineStoreProvider).books[itemId];
     final url = meta?.coverUrl(config.absUrl) ?? '';
+    final headers = {'Authorization': 'Bearer ${config.absToken}'};
+
+    // Short screens (landscape / small phones): compact side-by-side row.
+    if (compact) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 52,
+              height: 72,
+              child: CoverImage(
+                url: url,
+                localPath: offlineBook?.coverPath,
+                httpHeaders: headers,
+                radius: 8,
+                iconSize: 24,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    meta?.title ?? '',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: AppColors.textPrimary,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    meta?.author ?? '',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    }
 
     return Column(
       children: [
@@ -401,43 +479,33 @@ class _HeaderInfo extends ConsumerWidget {
                   color: Colors.black54, blurRadius: 12, offset: Offset(0, 6)),
             ],
           ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(AppColors.cardRadius),
-            child: url.isEmpty
-                ? Container(
-                    color: AppColors.surface,
-                    child: const Icon(Icons.menu_book_rounded,
-                        color: AppColors.surfaceElevated, size: 36),
-                  )
-                : CachedNetworkImage(
-                    imageUrl: url,
-                    httpHeaders: {
-                      'Authorization': 'Bearer ${config.absToken}',
-                    },
-                    fit: BoxFit.cover,
-                    errorWidget: (_, _, _) => Container(
-                      color: AppColors.surface,
-                      child: const Icon(Icons.menu_book_rounded,
-                          color: AppColors.surfaceElevated, size: 36),
-                    ),
-                  ),
+          child: CoverImage(
+            url: url,
+            localPath: offlineBook?.coverPath,
+            httpHeaders: headers,
+            radius: AppColors.cardRadius,
+            iconSize: 36,
           ),
         ),
         const SizedBox(height: 10),
         Text(
           meta?.title ?? '',
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          textAlign: TextAlign.center,
           style: const TextStyle(
               color: AppColors.textPrimary,
               fontSize: 17,
               fontWeight: FontWeight.w600),
-          textAlign: TextAlign.center,
         ),
         const SizedBox(height: 4),
         Text(
           meta?.author ?? '',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          textAlign: TextAlign.center,
           style:
               const TextStyle(color: AppColors.textSecondary, fontSize: 13),
-          textAlign: TextAlign.center,
         ),
         const SizedBox(height: 8),
       ],

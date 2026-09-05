@@ -1,6 +1,9 @@
+import 'dart:convert';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/network/abs_client.dart';
+import '../../core/offline/offline_provider.dart';
 import '../../models/abs_item.dart';
 import '../../models/vtt_cue.dart';
 import 'audio_handler.dart';
@@ -114,10 +117,17 @@ final audioHandlerProvider = Provider<AudiobookAudioHandler>((ref) {
   return handler;
 });
 
-/// Small cached provider for player header info (title/author/cover),
-/// fetched directly from ABS.
+/// Small cached provider for player header info (title/author/cover).
+/// Serves downloaded books instantly from local storage; otherwise fetches
+/// from ABS, returning null when the server is unreachable.
 final bookMetaProvider = FutureProvider.family<AbsItem?, String>(
   (ref, itemId) async {
+    final offlineBook = ref.watch(offlineStoreProvider).books[itemId];
+    if (offlineBook != null) {
+      return AbsItem.fromJson(
+        jsonDecode(offlineBook.itemJson) as Map<String, dynamic>,
+      );
+    }
     final abs = ref.read(absClientProvider);
     try {
       final res = await abs.get('/api/items/$itemId');
