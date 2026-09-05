@@ -34,7 +34,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(playerProvider.notifier).init(widget.itemId, widget.chapterIndex);
+      ref
+          .read(playerProvider.notifier)
+          .init(widget.itemId, widget.chapterIndex);
     });
   }
 
@@ -159,7 +161,6 @@ class _AppBar extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final player = ref.watch(playerProvider);
-
     return Row(
       children: [
         IconButton(
@@ -177,8 +178,13 @@ class _AppBar extends ConsumerWidget {
             overflow: TextOverflow.ellipsis,
           ),
         ),
+        // Direct-access theme cycle button (long-press → open sheet).
+        // Single tap cycles through themes so users don't have to
+        // open the overflow menu just to change the look.
+        _QuickThemeButton(),
         IconButton(
           icon: const Icon(Icons.more_vert),
+          tooltip: 'More options',
           onPressed: () => _showOverflowMenu(context, ref),
         ),
       ],
@@ -188,6 +194,8 @@ class _AppBar extends ConsumerWidget {
   void _showOverflowMenu(BuildContext context, WidgetRef ref) {
     final player = ref.watch(playerProvider);
     final notifier = ref.read(playerProvider.notifier);
+    final selectedTheme =
+        ref.watch(readerThemeProvider);
 
     showModalBottomSheet<void>(
       context: context,
@@ -199,12 +207,36 @@ class _AppBar extends ConsumerWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            // ── Reader theme (now with a visible current-theme chip)
             ListTile(
-              leading: const Icon(Icons.palette_outlined,
-                  color: AppColors.textPrimary),
+              leading: Container(
+                width: 28,
+                height: 28,
+                decoration: BoxDecoration(
+                  color: ReaderThemeData.all[selectedTheme]!.swatch,
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: AppColors.surfaceElevated, width: 1),
+                ),
+                alignment: Alignment.center,
+                child: Container(
+                  width: 12, height: 12,
+                  decoration: BoxDecoration(
+                    color: ReaderThemeData.all[selectedTheme]!.highlightBg,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ),
               title: const Text('Reader theme',
                   style: TextStyle(
                       color: AppColors.textPrimary, fontSize: 14)),
+              subtitle: Text(
+                ReaderThemeData.all[selectedTheme]!.name,
+                style: const TextStyle(
+                    color: AppColors.textSecondary, fontSize: 12),
+              ),
+              trailing: const Icon(Icons.chevron_right,
+                  color: AppColors.textSecondary, size: 20),
               onTap: () {
                 Navigator.of(context).pop();
                 showModalBottomSheet<void>(
@@ -219,6 +251,7 @@ class _AppBar extends ConsumerWidget {
               },
             ),
             const Divider(height: 1),
+            // ── Sleep timer
             const Padding(
               padding: EdgeInsets.all(16),
               child: Align(
@@ -250,6 +283,7 @@ class _AppBar extends ConsumerWidget {
                   },
                 )),
             const Divider(),
+            // ── Font size
             const Padding(
               padding: EdgeInsets.all(16),
               child: Align(
@@ -284,6 +318,60 @@ class _AppBar extends ConsumerWidget {
             ),
             const SizedBox(height: 12),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Quick theme cycle: tap to advance to the next theme, long-press to
+/// open the full picker. Lives in the AppBar so users have a one-tap
+/// path to changing the look without opening the overflow menu.
+class _QuickThemeButton extends ConsumerWidget {
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final current = ref.watch(readerThemeProvider);
+    final data = ReaderThemeData.all[current]!;
+    return Tooltip(
+      message: 'Theme: ${data.name} (tap to cycle, long-press to pick)',
+      child: GestureDetector(
+        onTap: () {
+          final values = ReaderThemeType.values;
+          final next = values[(values.indexOf(current) + 1) % values.length];
+          ref.read(readerThemeProvider.notifier).set(next);
+        },
+        onLongPress: () {
+          showModalBottomSheet<void>(
+            context: context,
+            backgroundColor: AppColors.surface,
+            shape: const RoundedRectangleBorder(
+              borderRadius:
+                  BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            builder: (_) => const ThemeSheet(),
+          );
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+          child: Container(
+            width: 24, height: 24,
+            decoration: BoxDecoration(
+              color: data.swatch,
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: AppColors.textPrimary.withValues(alpha: 0.4),
+                width: 1,
+              ),
+            ),
+            alignment: Alignment.center,
+            child: Container(
+              width: 10, height: 10,
+              decoration: BoxDecoration(
+                color: data.highlightBg,
+                shape: BoxShape.circle,
+              ),
+            ),
+          ),
         ),
       ),
     );
@@ -356,5 +444,3 @@ class _HeaderInfo extends ConsumerWidget {
     );
   }
 }
-
-

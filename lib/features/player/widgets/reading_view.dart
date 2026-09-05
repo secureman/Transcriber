@@ -1,3 +1,4 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -56,34 +57,41 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
     final cueIndex = player.currentCueIndex;
     if (cueIndex != null) _scrollToCue(cueIndex);
 
-    void onWordTap(Duration ts) =>
-        ref.read(playerProvider.notifier).seekTo(ts);
+    // Single callback used by every word. The cue's children call this
+    // with the timestamp of the tapped word.
+    void onWordTap(Duration ts) {
+      ref.read(playerProvider.notifier).seekTo(ts);
+    }
 
     return ColoredBox(
       color: theme.background,
       child: Column(
         children: [
           if (player.servedFromCache) _CacheBanner(theme: theme),
-          Expanded(child: ListView(
-        controller: _scrollController,
-        physics: const BouncingScrollPhysics(),
-        padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 20),
-        children: [
-          for (var ci = 0; ci < player.cues.length; ci++)
-            _CueParagraph(
-              key: _keyFor(ci),
-              cue: player.cues[ci],
-              cueIndex: ci,
-              activeCueIndex: cueIndex,
-              activeWordIndex: cueIndex == ci ? player.currentWordIndex : null,
-              fontSize: player.readingFontSize,
-              isArabic: player.isArabic,
-              theme: theme,
-              onWordTap: onWordTap,
+          Expanded(
+            child: ListView(
+              controller: _scrollController,
+              physics: const BouncingScrollPhysics(),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 22, vertical: 20),
+              children: [
+                for (var ci = 0; ci < player.cues.length; ci++)
+                  _CueParagraph(
+                    key: _keyFor(ci),
+                    cue: player.cues[ci],
+                    cueIndex: ci,
+                    activeCueIndex: cueIndex,
+                    activeWordIndex:
+                        cueIndex == ci ? player.currentWordIndex : null,
+                    fontSize: player.readingFontSize,
+                    isArabic: player.isArabic,
+                    theme: theme,
+                    onWordTap: onWordTap,
+                  ),
+                const SizedBox(height: 40),
+              ],
             ),
-          const SizedBox(height: 40),
-        ],
-      )),
+          ),
         ],
       ),
     );
@@ -130,7 +138,9 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
                 Text(
                   '${(p * 100).round()}%',
                   style: TextStyle(
-                      color: theme.text.withValues(alpha: 0.5), fontSize: 12),
+                    color: theme.text.withValues(alpha: 0.5),
+                    fontSize: 12,
+                  ),
                 ),
               ],
             ),
@@ -152,8 +162,9 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
             Text(
               "This chapter hasn't been transcribed yet",
               style: TextStyle(
-                  color: theme.text.withValues(alpha: 0.6),
-                  fontSize: player.readingFontSize * 0.68),
+                color: theme.text.withValues(alpha: 0.6),
+                fontSize: player.readingFontSize * 0.68,
+              ),
               textAlign: TextAlign.center,
             ),
             if (hasBe) ...[
@@ -163,8 +174,9 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
                   backgroundColor: theme.highlightBg,
                   foregroundColor: theme.highlightText,
                 ),
-                onPressed: () =>
-                    ref.read(playerProvider.notifier).transcribeCurrentChapter(),
+                onPressed: () => ref
+                    .read(playerProvider.notifier)
+                    .transcribeCurrentChapter(),
                 child: const Text('TRANSCRIBE NOW'),
               ),
             ],
@@ -193,8 +205,7 @@ class _CacheBanner extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Icon(Icons.wifi_off_rounded,
-              size: 13,
-              color: theme.text.withValues(alpha: 0.45)),
+              size: 13, color: theme.text.withValues(alpha: 0.45)),
           const SizedBox(width: 6),
           Text(
             'Server offline · showing cached transcript',
@@ -209,7 +220,14 @@ class _CacheBanner extends StatelessWidget {
   }
 }
 
-// ── Cue paragraph ─────────────────────────────────────────────────────────
+// ── Cue paragraph (stable layout, reliable tap) ──────────────────────────
+//
+// One Text.rich per cue, with one TapGestureRecognizer per word.
+// Layout doesn't shift when the active word changes (the highlighted
+// word is rendered as a WidgetSpan inside the same Text.rich, so the
+// line breaks and word positions stay put). Past words get a dim color
+// via TextSpan.color; the active word gets a WidgetSpan with a
+// background-color Container.
 
 class _CueParagraph extends StatelessWidget {
   const _CueParagraph({
@@ -244,49 +262,61 @@ class _CueParagraph extends StatelessWidget {
       color: theme.text,
       fontWeight: FontWeight.w400,
     );
-    final dimStyle =
-        baseStyle.copyWith(color: theme.text.withValues(alpha: theme.dimOpacity));
+    final dimStyle = baseStyle.copyWith(
+      color: theme.text.withValues(alpha: theme.dimOpacity),
+    );
+    final activeTextStyle = GoogleFonts.lora(
+      fontSize: fontSize,
+      height: 1.85,
+      color: theme.highlightText,
+      fontWeight: FontWeight.w700,
+    );
+
+    // Build inline spans. A WidgetSpan for the active word so it gets
+    // the amber pill background, TextSpan for everything else.
+    final spans = <InlineSpan>[];
+    for (var wi = 0; wi < cue.words.length; wi++) {
+      final word = cue.words[wi];
+      final isActive = isCurrent && wi == activeWordIndex;
+      final isPastWord = isPastCue ||
+          (isCurrent && activeWordIndex != null && wi < activeWordIndex!);
+
+      if (isActive) {
+        spans.add(WidgetSpan(
+          alignment: PlaceholderAlignment.middle,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => onWordTap(word.start),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: theme.highlightBg,
+                borderRadius: BorderRadius.circular(5),
+              ),
+              child: Text(word.text, style: activeTextStyle),
+            ),
+          ),
+        ));
+      } else {
+        spans.add(TextSpan(
+          text: word.text,
+          style: isPastWord ? dimStyle : baseStyle,
+          recognizer: TapGestureRecognizer()..onTap = () => onWordTap(word.start),
+        ));
+      }
+
+      // Inter-word space, except after the last word.
+      if (wi < cue.words.length - 1) {
+        spans.add(TextSpan(text: ' ', style: isPastWord ? dimStyle : baseStyle));
+      }
+    }
 
     return Padding(
-      padding: const EdgeInsets.only(bottom: 16),
-      child: Wrap(
+      padding: const EdgeInsets.only(bottom: 18),
+      child: Text.rich(
+        TextSpan(children: spans),
         textDirection: isArabic ? TextDirection.rtl : TextDirection.ltr,
-        children: List.generate(cue.words.length, (wi) {
-          final word = cue.words[wi];
-          final isActive = isCurrent && wi == activeWordIndex;
-          final isPastWord = isPastCue ||
-              (isCurrent && activeWordIndex != null && wi < activeWordIndex!);
-
-          return GestureDetector(
-            onTap: () => onWordTap(word.start),
-            child: Padding(
-              // Right padding becomes inter-word spacing.
-              padding: const EdgeInsets.only(right: 4, bottom: 2),
-              child: isActive
-                  ? Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 6, vertical: 1),
-                      decoration: BoxDecoration(
-                        color: theme.highlightBg,
-                        borderRadius: BorderRadius.circular(5),
-                      ),
-                      child: Text(
-                        word.text,
-                        style: GoogleFonts.lora(
-                          fontSize: fontSize,
-                          height: 1.85,
-                          color: theme.highlightText,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    )
-                  : Text(
-                      word.text,
-                      style: isPastWord ? dimStyle : baseStyle,
-                    ),
-            ),
-          );
-        }),
+        textAlign: isArabic ? TextAlign.right : TextAlign.justify,
       ),
     );
   }
