@@ -1,34 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Allow cleartext HTTP to private network ranges so the app can reach
-    a self-hosted Audiobookshelf + transcription server on the LAN.
-    The /api/items/{id}/cover and /api/items/{id}/file/{ino} endpoints
-    are served over plain HTTP in most home setups.
+    Allow cleartext HTTP for self-hosted ABS + transcription server running
+    on the LAN. The <domain> element only matches exact hostnames — it does
+    NOT work as a CIDR subnet mask — so the old per-subnet entries never
+    covered any real device IPs. ExoPlayer (just_audio) is subject to
+    Android's NSP while Dart/Dio is not, which is why REST calls worked but
+    audio loading was silently blocked.
 
-    If you switch to HTTPS (recommended for any internet-facing server),
-    delete the base-config block below AND remove the
-    android:usesCleartextTraffic attribute from AndroidManifest.xml.
+    For a LAN-only self-hosted setup this is safe. If you ever expose the
+    servers to the internet, replace this with a <domain-config> scoped to
+    your specific host and use HTTPS.
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false">
+    <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-
-    <!-- RFC1918 private IPv4 ranges. Add more <domain> entries if your
-         ABS lives on a public IP but you still want to keep cleartext
-         local. -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">10.0.2.2</domain>  <!-- emulator host loopback -->
-        <domain includeSubdomains="true">localhost</domain>
-        <!-- Catch-all for any IP the user might type. Android evaluates
-             these as CIDR-like; if your server has a fixed LAN IP, add
-             it explicitly here. -->
-        <domain includeSubdomains="true">192.168.0.0</domain>
-        <domain includeSubdomains="true">192.168.1.0</domain>
-        <domain includeSubdomains="true">192.168.2.0</domain>
-        <domain includeSubdomains="true">10.0.0.0</domain>
-        <domain includeSubdomains="true">172.16.0.0</domain>
-    </domain-config>
 </network-security-config>

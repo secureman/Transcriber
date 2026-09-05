@@ -28,6 +28,7 @@ class PlayerState {
   final double readingFontSize;
   final bool isArabic;
   final double transcribeProgress; // 0..1 from the backend's 202 vtt response
+  final bool servedFromCache;  // true when VTT was served from local cache (server offline)
 
   const PlayerState({
     this.itemId,
@@ -48,6 +49,7 @@ class PlayerState {
     this.readingFontSize = 22,
     this.isArabic = false,
     this.transcribeProgress = 0,
+    this.servedFromCache = false,
   });
 
   bool get hasVtt => vttStatus == VttStatus.ready && cues.isNotEmpty;
@@ -77,6 +79,7 @@ class PlayerState {
     double? readingFontSize,
     bool? isArabic,
     double? transcribeProgress,
+    bool? servedFromCache,
   }) =>
       PlayerState(
         itemId: itemId ?? this.itemId,
@@ -100,6 +103,7 @@ class PlayerState {
         isArabic: isArabic ?? this.isArabic,
         transcribeProgress:
             transcribeProgress ?? this.transcribeProgress,
+        servedFromCache: servedFromCache ?? this.servedFromCache,
       );
 }
 

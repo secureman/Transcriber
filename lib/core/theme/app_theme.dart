@@ -120,3 +120,90 @@ class AppTheme {
         fontWeight: bold ? FontWeight.w700 : FontWeight.w400,
       );
 }
+
+// ── Reader Themes ─────────────────────────────────────────────────────────
+
+enum ReaderThemeType { dusk, midnight, parchment, snow, forest }
+
+@immutable
+class ReaderThemeData {
+  const ReaderThemeData({
+    required this.name,
+    required this.background,
+    required this.surface,
+    required this.text,
+    required this.dimOpacity,
+    required this.highlightBg,
+    required this.highlightText,
+    required this.isDark,
+    required this.swatch,
+  });
+
+  final String name;
+  final Color background;
+  final Color surface;
+  final Color text;
+  final double dimOpacity; // applied to past words
+  final Color highlightBg;
+  final Color highlightText;
+  final bool isDark;
+  final Color swatch; // preview circle in the picker
+
+  static const Map<ReaderThemeType, ReaderThemeData> all = {
+    ReaderThemeType.dusk: ReaderThemeData(
+      name: 'Dusk',
+      background: Color(0xFF1C1C1E),
+      surface: Color(0xFF28282A),
+      text: Color(0xFFEEEEEE),
+      dimOpacity: 0.28,
+      highlightBg: Color(0xFFF5A623),
+      highlightText: Color(0xFF0D0D0D),
+      isDark: true,
+      swatch: Color(0xFF1C1C1E),
+    ),
+    ReaderThemeType.midnight: ReaderThemeData(
+      name: 'Midnight',
+      background: Color(0xFF000000),
+      surface: Color(0xFF141414),
+      text: Color(0xFFFFFFFF),
+      dimOpacity: 0.28,
+      highlightBg: Color(0xFFF5A623),
+      highlightText: Color(0xFF000000),
+      isDark: true,
+      swatch: Color(0xFF000000),
+    ),
+    ReaderThemeType.parchment: ReaderThemeData(
+      name: 'Parchment',
+      background: Color(0xFFF4ECD8),
+      surface: Color(0xFFEDE0C4),
+      text: Color(0xFF3D2B1F),
+      dimOpacity: 0.30,
+      highlightBg: Color(0xFFC47A2B),
+      highlightText: Color(0xFFFFFFFF),
+      isDark: false,
+      swatch: Color(0xFFF4ECD8),
+    ),
+    ReaderThemeType.snow: ReaderThemeData(
+      name: 'Snow',
+      background: Color(0xFFF8F8F8),
+      surface: Color(0xFFEBEBEB),
+      text: Color(0xFF1A1A1A),
+      dimOpacity: 0.28,
+      highlightBg: Color(0xFFF5A623),
+      highlightText: Color(0xFF0D0D0D),
+      isDark: false,
+      swatch: Color(0xFFF8F8F8),
+    ),
+    ReaderThemeType.forest: ReaderThemeData(
+      name: 'Forest',
+      background: Color(0xFF1B2B22),
+      surface: Color(0xFF263830),
+      text: Color(0xFFC8E6C9),
+      dimOpacity: 0.28,
+      highlightBg: Color(0xFF66BB6A),
+      highlightText: Color(0xFF0D0D0D),
+      isDark: true,
+      swatch: Color(0xFF1B2B22),
+    ),
+  };
+}

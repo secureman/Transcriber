@@ -94,6 +94,7 @@ class BookDetailScreen extends ConsumerWidget {
                   ...List.generate(book.chapters.length, (i) {
                     final ch = book.chapters[i];
                     return ChapterListTile(
+                      itemId: itemId,
                       chapter: ch,
                       index: i,
                       job: statuses[i],

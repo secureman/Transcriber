@@ -6,6 +6,7 @@ import 'package:just_audio/just_audio.dart' hide PlayerState;
 import '../../core/network/abs_client.dart';
 import '../../core/network/backend_client.dart';
 import '../../core/providers/config_provider.dart';
+import '../../core/providers/read_chapters_provider.dart';
 import '../../core/providers/shared_prefs_provider.dart';
 import '../../core/utils/duration_ext.dart';
 import '../../core/utils/vtt_parser.dart';
@@ -17,15 +18,23 @@ class PlayerController extends Notifier<PlayerState> {
   Timer? _vttPollTimer;
   Timer? _sleepTimer;
   StreamSubscription<Duration>? _positionSub;
-  // BUG FIX: the previous version added a new `processingStateStream.listen`
-  // on every `_loadAudio` call without cancelling the previous one. After
-  // N chapter skips you had N listeners all firing `_onChapterEnd` on
-  // completion → cascading skips. Now we keep exactly one.
   StreamSubscription<ProcessingState>? _processingSub;
-  // BUG FIX: track playing state so the play/pause button reflects reality.
+  // BUG FIX v1: track playing state so play/pause button reflects reality.
   StreamSubscription<bool>? _playingSub;
   int _lastEmitMs = 0;
   int _loadedChapterIndex = -1;
+
+  // ── VTT cache helpers ──────────────────────────────────────────────
+  // Keyed by "vtt_$itemId_$chapterIndex". VTTs are typically 100–400 KB;
+  // SharedPreferences can handle this fine on Android/iOS.
+
+  static String _cacheKey(String itemId, int ch) => 'vtt_${itemId}_$ch';
+
+  String? _readCache(String itemId, int ch) =>
+      ref.read(sharedPrefsProvider).getString(_cacheKey(itemId, ch));
+
+  Future<void> _writeCache(String itemId, int ch, String vtt) =>
+      ref.read(sharedPrefsProvider).setString(_cacheKey(itemId, ch), vtt);
 
   @override
   PlayerState build() {
@@ -41,13 +50,9 @@ class PlayerController extends Notifier<PlayerState> {
     _playingSub?.cancel();
   }
 
-  /// Entry point: loads chapter audio and VTT in parallel.
-  /// Audio never waits for VTT.
   Future<void> init(String itemId, int chapterIndex) async {
-    // BUG FIX: added `state.audioReady` to the guard so a failed audio load
-    // doesn't permanently block retries (previously, state.itemId was set
-    // before _loadAudio ran, so the guard fired on the next init() call and
-    // the audio stayed broken forever).
+    // BUG FIX v1: also require audioReady so a failed load doesn't
+    // permanently block retries via this early-return guard.
     if (state.itemId == itemId &&
         _loadedChapterIndex == chapterIndex &&
         state.audioReady) return;
@@ -68,17 +73,9 @@ class PlayerController extends Notifier<PlayerState> {
       readingFontSize: lastSize,
     );
 
-    // BUG FIX: _loadAudio exceptions were propagating through Future.wait and
-    // getting silently swallowed by the unawaited addPostFrameCallback call.
-    // That left the player with chapterDuration=0 and audioReady=false while
-    // the VTT still showed (since _loadVtt catches its own errors). Now we
-    // catch audio errors here so the rest of the player still works and the
-    // user can at least read the transcript even if audio fails.
+    // BUG FIX v1: catch audio errors so VTT still loads.
     await Future.wait([
-      _loadAudio(itemId, chapterIndex).catchError((Object e) {
-        // Audio failed: keep audioReady=false so controls stay disabled.
-        // VTT loading continues unaffected.
-      }),
+      _loadAudio(itemId, chapterIndex).catchError((Object e) {}),
       _loadVtt(itemId, chapterIndex),
     ]);
 
@@ -96,7 +93,6 @@ class PlayerController extends Notifier<PlayerState> {
       throw Exception('Failed to load item (HTTP ${res.statusCode})');
     }
     final item = AbsItem.fromJson(res.data as Map<String, dynamic>);
-
     final isArabic =
         item.isArabic || (item.language?.toLowerCase().startsWith('ar') ?? false);
 
@@ -138,40 +134,71 @@ class PlayerController extends Notifier<PlayerState> {
       totalChapters: totalChapters,
     );
 
-    // Single subscription, cancellable on next chapter load. See _cleanup.
     _processingSub = handler.player.processingStateStream.listen((ps) {
       if (ps == ProcessingState.completed) _onChapterEnd();
     });
   }
 
+  // ── VTT loading with offline cache ────────────────────────────────
 
   Future<void> _loadVtt(String itemId, int chapterIndex) async {
-    // Without a transcription backend there is no text to show.
     if (!ref.read(configProvider).backendConfigured) {
-      state = state.copyWith(vttStatus: VttStatus.notFound);
+      // No backend — try cache before giving up.
+      final cached = _readCache(itemId, chapterIndex);
+      if (cached != null) {
+        _applyVtt(cached, fromCache: true);
+      } else {
+        state = state.copyWith(vttStatus: VttStatus.notFound);
+      }
       return;
     }
+
     final backend = ref.read(backendClientProvider);
     try {
       final res = await backend.get('/api/vtt/$itemId/$chapterIndex');
       switch (res.statusCode) {
         case 200:
-          _applyVtt(res.data.toString());
+          final vtt = res.data.toString();
+          await _writeCache(itemId, chapterIndex, vtt); // persist for offline
+          _applyVtt(vtt, fromCache: false);
           return;
+
         case 202:
+          // Server is still transcribing — serve cache immediately if we have
+          // it so the user can read while waiting for the new version.
+          final cached = _readCache(itemId, chapterIndex);
+          if (cached != null) {
+            _applyVtt(cached, fromCache: true);
+            return;
+          }
           state = state.copyWith(
             vttStatus: VttStatus.transcribing,
-            transcribeProgress:
-                _progressFrom202(res.data),
+            transcribeProgress: _progressFrom202(res.data),
           );
           _pollVtt(itemId, chapterIndex);
           return;
+
+        case 404:
+          final cached = _readCache(itemId, chapterIndex);
+          if (cached != null) {
+            _applyVtt(cached, fromCache: true);
+          } else {
+            state = state.copyWith(vttStatus: VttStatus.notFound);
+          }
+          return;
+
         default:
           state = state.copyWith(vttStatus: VttStatus.notFound);
           return;
       }
     } catch (_) {
-      state = state.copyWith(vttStatus: VttStatus.notFound);
+      // Network error (server offline / unreachable) — fall back to cache.
+      final cached = _readCache(itemId, chapterIndex);
+      if (cached != null) {
+        _applyVtt(cached, fromCache: true);
+      } else {
+        state = state.copyWith(vttStatus: VttStatus.notFound);
+      }
     }
   }
 
@@ -183,7 +210,9 @@ class PlayerController extends Notifier<PlayerState> {
         final res = await backend.get('/api/vtt/$itemId/$chapterIndex');
         if (res.statusCode == 200) {
           t.cancel();
-          _applyVtt(res.data.toString());
+          final vtt = res.data.toString();
+          await _writeCache(itemId, chapterIndex, vtt);
+          _applyVtt(vtt, fromCache: false);
         } else if (res.statusCode == 202) {
           state = state.copyWith(
             transcribeProgress: _progressFrom202(res.data),
@@ -195,18 +224,24 @@ class PlayerController extends Notifier<PlayerState> {
             transcribeProgress: 0,
           );
         }
-        // 202 → keep polling
       } catch (_) {
-        // transient network error → keep polling
+        // Transient network error during polling — keep polling, serve cache
+        // if we haven't applied it yet.
+        if (!state.hasVtt) {
+          final cached = _readCache(itemId, chapterIndex);
+          if (cached != null) {
+            t.cancel();
+            _applyVtt(cached, fromCache: true);
+          }
+        }
       }
     });
   }
 
-  void _applyVtt(String vttContent) {
+  void _applyVtt(String vttContent, {required bool fromCache}) {
     final cues = VttParser.parse(vttContent);
     if (cues.isEmpty) {
-      state = state.copyWith(
-          vttStatus: VttStatus.notFound, transcribeProgress: 0);
+      state = state.copyWith(vttStatus: VttStatus.notFound, transcribeProgress: 0);
       return;
     }
     state = state.copyWith(
@@ -214,21 +249,16 @@ class PlayerController extends Notifier<PlayerState> {
       cues: cues,
       flatWords: VttParser.flattenWords(cues),
       transcribeProgress: 0,
+      servedFromCache: fromCache,
     );
     _syncWord(state.position);
   }
 
-  /// Parses the 202 body {"status": "processing", "progress": 0..1}.
-  ///
-  /// BUG FIX: the backend job_runner stores progress as a 0.0–1.0 float
-  /// (e.g. 0.15 for 15%), NOT a 0–100 integer. The old code divided by 100,
-  /// so 15% progress showed as 0.15% on the progress bar.
+  /// BUG FIX v1: backend sends 0.0–1.0, old code divided by 100.
   double _progressFrom202(dynamic data) {
     if (data is Map<String, dynamic>) {
       final p = data['progress'];
-      if (p is num) {
-        return p.toDouble().clamp(0.0, 1.0);
-      }
+      if (p is num) return p.toDouble().clamp(0.0, 1.0);
     }
     return 0.0;
   }
@@ -238,7 +268,6 @@ class PlayerController extends Notifier<PlayerState> {
 
     _positionSub?.cancel();
     _positionSub = handler.player.positionStream.listen((position) {
-      // Throttle to ~100ms to limit provider rebuilds.
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (nowMs - _lastEmitMs < 90) return;
       _lastEmitMs = nowMs;
@@ -246,9 +275,7 @@ class PlayerController extends Notifier<PlayerState> {
       _syncWord(position);
     });
 
-    // BUG FIX: the old code never listened to playingStream, so state.playing
-    // was always false. The play button always showed ▶ even while the audio
-    // was playing, and the ⏸ icon never appeared.
+    // BUG FIX v1: was never listening to playingStream.
     _playingSub?.cancel();
     _playingSub = handler.player.playingStream.listen((isPlaying) {
       state = state.copyWith(playing: isPlaying);
@@ -260,9 +287,7 @@ class PlayerController extends Notifier<PlayerState> {
     if (words.isEmpty) return;
     final word = VttParser.findWordAt(position, words);
     if (word == null) {
-      if (state.currentCueIndex != null) {
-        state = state.copyWith(clearWord: true);
-      }
+      if (state.currentCueIndex != null) state = state.copyWith(clearWord: true);
       return;
     }
     if (word.cueIndex != state.currentCueIndex ||
@@ -273,7 +298,6 @@ class PlayerController extends Notifier<PlayerState> {
       );
     }
   }
-
 
   // ── Playback controls ──────────────────────────────────────────────
 
@@ -287,19 +311,14 @@ class PlayerController extends Notifier<PlayerState> {
   }
 
   Future<void> seekTo(Duration d) => ref.read(audioHandlerProvider).seek(d);
-
-  Future<void> skipForward15() =>
-      ref.read(audioHandlerProvider).skipForward15();
-
-  Future<void> skipBackward15() =>
-      ref.read(audioHandlerProvider).skipBackward15();
+  Future<void> skipForward15() => ref.read(audioHandlerProvider).skipForward15();
+  Future<void> skipBackward15() => ref.read(audioHandlerProvider).skipBackward15();
 
   Future<void> setSpeed(double speed) async {
     await ref.read(audioHandlerProvider).setSpeed(speed);
     state = state.copyWith(speed: speed);
   }
 
-  /// Cycles 0.75 → 0.9 → 1.0 → 1.1 → 1.25 → 1.5 → 2.0 → 0.75
   Future<void> cycleSpeed() async {
     const speeds = [0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0];
     final idx = speeds.indexOf(state.speed);
@@ -307,7 +326,6 @@ class PlayerController extends Notifier<PlayerState> {
     await setSpeed(next);
   }
 
-  /// Loads another chapter by re-initializing the provider.
   Future<void> switchChapter(int newIndex) async {
     final itemId = state.itemId;
     if (itemId == null) return;
@@ -318,32 +336,30 @@ class PlayerController extends Notifier<PlayerState> {
     await ref.read(audioHandlerProvider).play();
   }
 
-  /// Restart the book from chapter 0. Used after the "End of book" state
-  /// is reached and the user wants to go again.
   Future<void> restart() async {
     if (state.itemId == null) return;
     await switchChapter(0);
   }
 
   Future<void> nextChapter() => switchChapter(state.chapterIndex + 1);
-
   Future<void> prevChapter() => switchChapter(state.chapterIndex - 1);
 
   void _onChapterEnd() {
-    // Sleep "end of chapter": stop here and cancel the timer.
+    // Persist the "listened" flag for this chapter.
+    final itemId = state.itemId;
+    if (itemId != null) {
+      ref.read(readChaptersProvider.notifier)
+          .markListened(itemId, state.chapterIndex);
+    }
+
     if (state.sleepTimer == SleepTimerState.endOfChapter) {
       setSleepTimer(SleepTimerState.off);
       return;
     }
-    // BUG FIX: previously, on the LAST chapter this called nextChapter()
-    // which tried to load chapterIndex+1 → threw "Book has no chapters
-    // or audio files" and the player died silently. Now we stop, mark
-    // finished=true, and let the UI react.
     if (state.isOnLastChapter) {
       state = state.copyWith(playing: false, finished: true);
       return;
     }
-    // Auto-advance to the next chapter.
     if (state.audioReady) nextChapter();
   }
 
@@ -364,7 +380,6 @@ class PlayerController extends Notifier<PlayerState> {
         },
       );
     }
-    // endOfChapter is handled in _onChapterEnd.
   }
 
   // ── Font size ──────────────────────────────────────────────────────
@@ -375,7 +390,6 @@ class PlayerController extends Notifier<PlayerState> {
     await ref.read(sharedPrefsProvider).setDouble('reading_font_size', newSize);
   }
 
-  /// Called by the ReadingView's TRANSCRIBE NOW button.
   Future<bool> transcribeCurrentChapter() async {
     final itemId = state.itemId;
     if (itemId == null) return false;

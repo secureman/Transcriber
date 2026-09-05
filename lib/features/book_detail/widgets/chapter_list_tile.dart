@@ -1,18 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/providers/read_chapters_provider.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/utils/duration_ext.dart';
 import '../../../models/abs_item.dart';
 import '../book_detail_provider.dart';
 
-class ChapterListTile extends StatelessWidget {
+class ChapterListTile extends ConsumerWidget {
+  final String itemId;
   final AbsChapter chapter;
   final int index;
-  final ChapterJobStatus? job; // null → not transcribed
+  final ChapterJobStatus? job;
   final VoidCallback onTap;
 
   const ChapterListTile({
     super.key,
+    required this.itemId,
     required this.chapter,
     required this.index,
     required this.job,
@@ -20,7 +24,10 @@ class ChapterListTile extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final listenedSet = ref.watch(readChaptersProvider);
+    final isListened = listenedSet.contains('$itemId/$index');
+
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
       onTap: onTap,
@@ -35,7 +42,7 @@ class ChapterListTile extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _StatusBadge(job: job),
+            _TranscriptBadge(job: job),
             if (job?.isProcessing == true) ...[
               const SizedBox(height: 6),
               ClipRRect(
@@ -55,6 +62,10 @@ class ChapterListTile extends StatelessWidget {
                     color: AppColors.textSecondary, fontSize: 10),
               ),
             ],
+            if (isListened) ...[
+              const SizedBox(height: 4),
+              _ListenedBadge(),
+            ],
           ],
         ),
       ),
@@ -66,70 +77,99 @@ class ChapterListTile extends StatelessWidget {
   }
 }
 
-class _StatusBadge extends StatelessWidget {
-  final ChapterJobStatus? job;
+// ── Transcript status badge (unchanged logic) ─────────────────────────────
 
-  const _StatusBadge({required this.job});
+class _TranscriptBadge extends StatelessWidget {
+  final ChapterJobStatus? job;
+  const _TranscriptBadge({required this.job});
 
   @override
   Widget build(BuildContext context) {
-    final status = job?.status;
-    switch (status) {
+    switch (job?.status) {
       case ChapterJobStatus.done:
         return _pill(
           '✓ Ready',
-          foreground: AppColors.success,
-          background: AppColors.success.withValues(alpha: 0.12),
+          fg: AppColors.success,
+          bg: AppColors.success.withValues(alpha: 0.12),
         );
       case ChapterJobStatus.processing:
-        return _ShimmerPill(text: '⋯ Transcribing');
+        return const _ShimmerPill(text: '⋯ Transcribing');
       case ChapterJobStatus.pending:
         return _pill(
           '⋯ Queued',
-          foreground: AppColors.warning,
-          background: AppColors.warning.withValues(alpha: 0.12),
+          fg: AppColors.warning,
+          bg: AppColors.warning.withValues(alpha: 0.12),
         );
       case ChapterJobStatus.error:
         return Tooltip(
           message: job?.errorMessage ?? 'Transcription failed',
           child: _pill(
             '⚠ Failed',
-            foreground: AppColors.error,
-            background: AppColors.error.withValues(alpha: 0.12),
+            fg: AppColors.error,
+            bg: AppColors.error.withValues(alpha: 0.12),
           ),
         );
       default:
         return _pill(
           '○ Not transcribed',
-          foreground: AppColors.textSecondary,
-          background: AppColors.surfaceElevated,
+          fg: AppColors.textSecondary,
+          bg: AppColors.surfaceElevated,
         );
     }
   }
 
-  Widget _pill(String text,
-      {required Color foreground, required Color background}) {
+  Widget _pill(String text, {required Color fg, required Color bg}) =>
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Text(
+          text,
+          style:
+              TextStyle(color: fg, fontSize: 11, fontWeight: FontWeight.w600),
+        ),
+      );
+}
+
+// ── "Listened" badge — visually distinct from the green ✓ Ready ──────────
+
+class _ListenedBadge extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    // Amber pill with a headphone icon — different shape, colour, and icon
+    // from the green ✓ Ready transcript badge.
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
       decoration: BoxDecoration(
-        color: background,
+        color: AppColors.primary.withValues(alpha: 0.15),
         borderRadius: BorderRadius.circular(10),
       ),
-      child: Text(
-        text,
-        style: TextStyle(
-          color: foreground,
-          fontSize: 11,
-          fontWeight: FontWeight.w600,
-        ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.headphones_rounded,
+              size: 11, color: AppColors.primary),
+          const SizedBox(width: 4),
+          Text(
+            'Listened',
+            style: TextStyle(
+              color: AppColors.primary,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
+// ── Shimmer pill (unchanged) ───────────────────────────────────────────────
+
 class _ShimmerPill extends StatefulWidget {
   final String text;
-
   const _ShimmerPill({required this.text});
 
   @override
@@ -138,12 +178,12 @@ class _ShimmerPill extends StatefulWidget {
 
 class _ShimmerPillState extends State<_ShimmerPill>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _controller;
+  late final AnimationController _c;
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
+    _c = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1200),
     )..repeat(reverse: true);
@@ -151,29 +191,27 @@ class _ShimmerPillState extends State<_ShimmerPill>
 
   @override
   void dispose() {
-    _controller.dispose();
+    _c.dispose();
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: Tween(begin: 0.45, end: 1.0).animate(_controller),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-        decoration: BoxDecoration(
-          color: AppColors.warning.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Text(
-          widget.text,
-          style: const TextStyle(
-            color: AppColors.warning,
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
+  Widget build(BuildContext context) => FadeTransition(
+        opacity: Tween(begin: 0.45, end: 1.0).animate(_c),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+          decoration: BoxDecoration(
+            color: AppColors.warning.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Text(
+            widget.text,
+            style: const TextStyle(
+              color: AppColors.warning,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+            ),
           ),
         ),
-      ),
-    );
-  }
+      );
 }

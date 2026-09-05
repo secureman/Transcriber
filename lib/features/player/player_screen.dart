@@ -6,12 +6,14 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../core/providers/config_provider.dart';
+import '../../core/providers/reader_theme_provider.dart';
 import '../../core/theme/app_theme.dart';
 import 'player_provider.dart';
 import 'player_state.dart';
 import 'widgets/audio_controls.dart';
 import 'widgets/chapter_scrubber.dart';
 import 'widgets/reading_view.dart';
+import 'widgets/theme_sheet.dart';
 
 class PlayerScreen extends ConsumerStatefulWidget {
   final String itemId;
@@ -68,13 +70,21 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                 const _AppBar(),
                 _HeaderInfo(itemId: widget.itemId, config: config),
                 Expanded(
-                  child: Container(
-                    margin: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-                    decoration: BoxDecoration(
-                      color: AppColors.surface.withValues(alpha: 0.6),
-                      borderRadius: BorderRadius.circular(AppColors.cardRadius),
-                    ),
-                    child: const ReadingView(),
+                  child: Consumer(
+                    builder: (_, ref, __) {
+                      final t = ReaderThemeData.all[
+                          ref.watch(readerThemeProvider)]!;
+                      return Container(
+                        margin: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                        clipBehavior: Clip.antiAlias,
+                        decoration: BoxDecoration(
+                          color: t.background,
+                          borderRadius:
+                              BorderRadius.circular(AppColors.cardRadius),
+                        ),
+                        child: const ReadingView(),
+                      );
+                    },
                   ),
                 ),
                 if (player.finished)
@@ -189,6 +199,26 @@ class _AppBar extends ConsumerWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            ListTile(
+              leading: const Icon(Icons.palette_outlined,
+                  color: AppColors.textPrimary),
+              title: const Text('Reader theme',
+                  style: TextStyle(
+                      color: AppColors.textPrimary, fontSize: 14)),
+              onTap: () {
+                Navigator.of(context).pop();
+                showModalBottomSheet<void>(
+                  context: context,
+                  backgroundColor: AppColors.surface,
+                  shape: const RoundedRectangleBorder(
+                    borderRadius:
+                        BorderRadius.vertical(top: Radius.circular(20)),
+                  ),
+                  builder: (_) => const ThemeSheet(),
+                );
+              },
+            ),
+            const Divider(height: 1),
             const Padding(
               padding: EdgeInsets.all(16),
               child: Align(
