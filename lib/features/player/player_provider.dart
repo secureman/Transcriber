@@ -33,6 +33,15 @@ class PlayerController extends Notifier<PlayerState> {
   String? _syncMediaId;
   double _syncBookDuration = 0;
   double _syncChapterStart = 0;
+  // How far into the current chapter the loaded ClippingAudioSource's clip
+  // actually starts, in seconds — 0 for a normal chapter load, non-zero
+  // when _loadAudio resumed mid-chapter (see the resumeTarget logic there).
+  // Needed because ClippingAudioSource reports position relative to its own
+  // `start` boundary, not the chapter's true start, so every raw position
+  // tick and every seek target must be corrected by this amount to stay in
+  // "seconds since chapter start" terms — which is what VTT cue timestamps,
+  // the chapter scrubber, and the whole-book ABS progress math all assume.
+  double _chapterOffsetSeconds = 0;
   int _syncStartedAt = 0;
   Duration _lastPosition = Duration.zero;
   List<Map<String, dynamic>> _syncAudioTracks = const [];
@@ -89,6 +98,7 @@ class PlayerController extends Notifier<PlayerState> {
     _syncMediaId = null;
     _syncBookDuration = 0;
     _syncChapterStart = 0;
+    _chapterOffsetSeconds = 0;
     _syncDisabled = false;
     _syncFailures = 0;
     _lastSyncMs = 0;
@@ -128,7 +138,7 @@ class PlayerController extends Notifier<PlayerState> {
         jsonDecode(offlineBook.itemJson) as Map<String, dynamic>,
       );
     } else {
-      final res = await abs.get('/api/items/$itemId');
+      final res = await abs.get('/api/items/$itemId?expanded=1');
       if (res.statusCode != 200) {
         throw Exception('Failed to load item (HTTP ${res.statusCode})');
       }
@@ -146,13 +156,45 @@ class PlayerController extends Notifier<PlayerState> {
     final chapter = item.chapters[chIndex];
     final totalChapters = item.chapters.length;
 
+    // Resume to the exact second, not just the top of the chapter.
+    //
+    // Previously this always seeked to chapter.start, even though the
+    // exact position was being faithfully pushed to ABS the whole time via
+    // _syncProgress() — a write-only relationship with the server. ABS's
+    // userMediaProgress.currentTime (only present when fetched with
+    // ?expanded=1, see AbsItem.fromJson) is the live, cross-device source
+    // of truth for "where did the user actually stop". We only apply it
+    // when it falls inside the chapter we're about to load — if it
+    // doesn't, this is ordinary chapter navigation (next/prev/tapped a
+    // different chapter), not a resume, and it should start at the top
+    // like before. Because the exact-second position is synced to ABS
+    // continuously as the book is played, a stale/previous chapter's
+    // progress value naturally won't fall in an unrelated chapter's
+    // range, so this check doesn't need any extra "is this the first
+    // load of the session" bookkeeping to stay correct.
+    final resumeTarget = item.resumeSeconds;
+    final seekSeconds =
+        (resumeTarget != null && resumeTarget >= chapter.start && resumeTarget < chapter.end)
+            ? resumeTarget
+            : chapter.start;
+    // How far into the chapter we're resuming — 0 for an ordinary (non-resume)
+    // chapter load. Needed below to keep the file's end-boundary anchored to
+    // the chapter's real end (not shifted forward by however far we skipped
+    // ahead) and to show the correct position immediately instead of a
+    // misleading "0:00" until the first position tick arrives.
+    final chapterOffsetSeconds = seekSeconds - chapter.start;
+
     final files = item.audioFiles
         .map((f) => (ino: f.ino, duration: f.duration))
         .toList();
     final (ino, offsetInFile) = AudiobookAudioHandler.resolveFilePosition(
       files: files,
-      seconds: chapter.start,
+      seconds: seekSeconds,
     );
+    // The file-position that corresponds to the chapter's true start (i.e.
+    // undoing the resume skip-ahead), so the file's end boundary below is
+    // computed the same way whether or not we're resuming mid-chapter.
+    final chapterStartOffsetInFile = offsetInFile - chapterOffsetSeconds;
 
     final title = item.title;
     final artist = item.author.isEmpty ? null : item.author;
@@ -163,6 +205,7 @@ class PlayerController extends Notifier<PlayerState> {
     _syncMediaId = item.mediaId.isEmpty ? null : item.mediaId;
     _syncBookDuration = item.duration;
     _syncChapterStart = chapter.start;
+    _chapterOffsetSeconds = chapterOffsetSeconds;
     _syncStartedAt = DateTime.now().millisecondsSinceEpoch;
     _syncAudioTracks = [
       for (var i = 0; i < item.audioFiles.length; i++)
@@ -199,7 +242,7 @@ class PlayerController extends Notifier<PlayerState> {
       await handler.loadChapterFromFile(
         filePath: filePath,
         startSec: offsetInFile,
-        endSec: offsetInFile + chapter.duration,
+        endSec: chapterStartOffsetInFile + chapter.duration,
         title: title,
         artist: artist,
         chapterNumber: chapterNumber,
@@ -212,7 +255,7 @@ class PlayerController extends Notifier<PlayerState> {
         itemId: itemId,
         fileIno: ino,
         startSec: offsetInFile,
-        endSec: offsetInFile + chapter.duration,
+        endSec: chapterStartOffsetInFile + chapter.duration,
         title: title,
         artist: artist,
         chapterNumber: chapterNumber,
@@ -224,9 +267,11 @@ class PlayerController extends Notifier<PlayerState> {
       isArabic: isArabic,
       audioReady: true,
       chapterDuration: chapter.duration.asDuration,
-      position: Duration.zero,
+      position: chapterOffsetSeconds.asDuration,
       chapterIndex: chIndex,
       totalChapters: totalChapters,
+      chapterStartInBook: chapter.start,
+      bookDurationSeconds: item.duration,
     );
 
     _processingSub = handler.player.processingStateStream.listen((ps) {
@@ -362,10 +407,17 @@ class PlayerController extends Notifier<PlayerState> {
     final handler = ref.read(audioHandlerProvider);
 
     _positionSub?.cancel();
-    _positionSub = handler.player.positionStream.listen((position) {
+    _positionSub = handler.player.positionStream.listen((raw) {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (nowMs - _lastEmitMs < 90) return;
       _lastEmitMs = nowMs;
+      // `raw` is relative to the ClippingAudioSource's own start boundary,
+      // which is the resume point when we skipped ahead mid-chapter — add
+      // that back so `position` stays in "seconds since chapter start"
+      // terms, matching VTT cue timestamps and the scrubber/ABS-sync math.
+      final position = _chapterOffsetSeconds == 0
+          ? raw
+          : raw + _chapterOffsetSeconds.asDuration;
       _lastPosition = position;
       state = state.copyWith(position: position);
       _syncWord(position);
@@ -476,9 +528,19 @@ class PlayerController extends Notifier<PlayerState> {
   Future<void> seekTo(Duration d) {
     // A manual seek changed the position — sync it on the next tick.
     _lastSyncMs = 0;
-    return ref.read(audioHandlerProvider).seek(d);
+    // Inverse of the position-listener adjustment above: `d` comes in as
+    // "seconds since chapter start" (what the scrubber shows), but the
+    // underlying ClippingAudioSource needs a position relative to its own
+    // start boundary — subtract back out the resume offset, if any.
+    final clipRelative = _chapterOffsetSeconds == 0
+        ? d
+        : d - _chapterOffsetSeconds.asDuration;
+    return ref
+        .read(audioHandlerProvider)
+        .seek(clipRelative.isNegative ? Duration.zero : clipRelative);
   }
   Future<void> skipForward15() => ref.read(audioHandlerProvider).skipForward15();
+  Future<void> skipForward30() => ref.read(audioHandlerProvider).skipForward30();
   Future<void> skipBackward15() => ref.read(audioHandlerProvider).skipBackward15();
 
   Future<void> setSpeed(double speed) async {

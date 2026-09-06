@@ -88,6 +88,16 @@ async def lifespan(app: FastAPI):
     await ffmpeg_service.init_encoder_profile()
     await db.init_db()
     ensure_dirs()
+    # Log exactly which DB we opened and what's in it. This is the single
+    # most useful line in the log for diagnosing "it re-transcribed
+    # chapters that were already done" — if the counts look wrong (e.g.
+    # 0 done on a book you know finished transcribing), the server opened
+    # the wrong database file. See paths.py for why that could happen.
+    counts = await db.job_status_counts()
+    logger.info(
+        "Database: %s (%s)", settings.DB_PATH,
+        ", ".join(f"{k}={v}" for k, v in counts.items()) or "empty",
+    )
     # Resets rows stuck in 'processing' (from a previous crash) to 'pending'
     # and starts the durable worker pool so transcription continues even if
     # the client backgrounds/closes the app.

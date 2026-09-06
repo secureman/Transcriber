@@ -10,12 +10,13 @@ import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
 import '../../core/providers/reader_theme_provider.dart';
 import '../../core/theme/app_theme.dart';
-import '../../core/widgets/cover_image.dart';
 import 'player_provider.dart';
 import 'player_state.dart';
 import 'widgets/audio_controls.dart';
 import 'widgets/chapter_scrubber.dart';
+import 'widgets/player_accessory_row.dart';
 import 'widgets/reading_view.dart';
+import 'widgets/sleep_timer_sheet.dart';
 import 'widgets/theme_sheet.dart';
 
 class PlayerScreen extends ConsumerStatefulWidget {
@@ -70,70 +71,61 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
           ),
           // 3. Foreground content.
           SafeArea(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                // Compact mode on short screens (landscape / small phones):
-                // collapse the header so the reading card always fits.
-                final compact = constraints.maxHeight < 620;
-                return Column(
-                  children: [
-                    const _AppBar(),
-                    _HeaderInfo(
-                      itemId: widget.itemId,
-                      config: config,
-                      compact: compact,
-                    ),
-                    Expanded(
-                      child: Consumer(
-                        builder: (_, ref, _) {
-                          final t = ReaderThemeData.all[
-                              ref.watch(readerThemeProvider)]!;
-                          return Container(
-                            margin: compact
-                                ? const EdgeInsets.fromLTRB(12, 4, 12, 4)
-                                : const EdgeInsets.fromLTRB(16, 8, 16, 8),
-                            clipBehavior: Clip.antiAlias,
-                            decoration: BoxDecoration(
-                              color: t.background,
-                              borderRadius: BorderRadius.circular(
-                                  AppColors.cardRadius),
-                            ),
-                            child: const ReadingView(),
-                          );
-                        },
-                      ),
-                    ),
-                    if (player.finished)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 24, vertical: 8),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            const Icon(Icons.check_circle,
-                                color: AppColors.success, size: 18),
-                            const SizedBox(width: 8),
-                            const Text(
-                              'End of book',
-                              style: TextStyle(
-                                  color: AppColors.textPrimary, fontSize: 13),
-                            ),
-                            const SizedBox(width: 16),
-                            FilledButton.tonal(
-                              onPressed: () =>
-                                  ref.read(playerProvider.notifier).restart(),
-                              child: const Text('Restart'),
-                            ),
-                          ],
+            child: Column(
+              children: [
+                _AppBar(itemId: widget.itemId),
+                Expanded(
+                  child: Consumer(
+                    builder: (_, ref, _) {
+                      final t = ReaderThemeData.all[
+                          ref.watch(readerThemeProvider)]!;
+                      return Container(
+                        margin: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                        clipBehavior: Clip.antiAlias,
+                        decoration: BoxDecoration(
+                          color: t.background,
+                          borderRadius:
+                              BorderRadius.circular(AppColors.cardRadius),
                         ),
-                      ),
-                    const AudioControls(),
-                    const SizedBox(height: 4),
-                    const ChapterScrubber(),
-                    SizedBox(height: compact ? 8 : 16),
-                  ],
-                );
-              },
+                        child: const ReadingView(),
+                      );
+                    },
+                  ),
+                ),
+                if (player.finished)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 24, vertical: 8),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(Icons.check_circle,
+                            color: AppColors.success, size: 18),
+                        const SizedBox(width: 8),
+                        const Text(
+                          'End of book',
+                          style: TextStyle(
+                              color: AppColors.textPrimary, fontSize: 13),
+                        ),
+                        const SizedBox(width: 16),
+                        FilledButton.tonal(
+                          onPressed: () =>
+                              ref.read(playerProvider.notifier).restart(),
+                          child: const Text('Restart'),
+                        ),
+                      ],
+                    ),
+                  ),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16),
+                  child: ChapterScrubber(),
+                ),
+                const SizedBox(height: 10),
+                const AudioControls(),
+                const SizedBox(height: 8),
+                const PlayerAccessoryRow(),
+                const SizedBox(height: 12),
+              ],
             ),
           ),
         ],
@@ -176,38 +168,62 @@ class _BackgroundCover extends ConsumerWidget {
 }
 
 class _AppBar extends ConsumerWidget {
-  const _AppBar();
+  final String itemId;
+
+  const _AppBar({required this.itemId});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final player = ref.watch(playerProvider);
-    return Row(
-      children: [
-        IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () => context.pop(),
-        ),
-        Expanded(
-          child: Text(
-            'Chapter ${player.chapterIndex + 1}',
-            style: const TextStyle(
-              color: AppColors.textPrimary,
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-            ),
-            overflow: TextOverflow.ellipsis,
+    final meta = ref.watch(bookMetaProvider(itemId)).valueOrNull;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Row(
+        children: [
+          IconButton(
+            icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 28),
+            tooltip: 'Minimize',
+            onPressed: () => context.pop(),
           ),
-        ),
-        // Direct-access theme cycle button (long-press → open sheet).
-        // Single tap cycles through themes so users don't have to
-        // open the overflow menu just to change the look.
-        _QuickThemeButton(),
-        IconButton(
-          icon: const Icon(Icons.more_vert),
-          tooltip: 'More options',
-          onPressed: () => _showOverflowMenu(context, ref),
-        ),
-      ],
+          Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  meta?.title ?? 'Loading…',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                if (meta?.author != null && meta!.author.isNotEmpty)
+                  Text(
+                    meta.author,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 12,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          // Direct-access theme cycle button (long-press → open sheet).
+          // Single tap cycles through themes so users don't have to
+          // open the overflow menu just to change the look.
+          _QuickThemeButton(),
+          IconButton(
+            icon: const Icon(Icons.more_vert),
+            tooltip: 'More options',
+            onPressed: () => _showOverflowMenu(context, ref),
+          ),
+        ],
+      ),
     );
   }
 
@@ -271,37 +287,33 @@ class _AppBar extends ConsumerWidget {
               },
             ),
             const Divider(height: 1),
-            // ── Sleep timer
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  'Sleep timer',
-                  style: TextStyle(
-                      color: AppColors.textPrimary,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 15),
-                ),
-              ),
-            ),
-            ...[
-              (SleepTimerState.off, 'Off'),
-              (SleepTimerState.min30, '30 minutes'),
-              (SleepTimerState.min60, '60 minutes'),
-              (SleepTimerState.endOfChapter, 'End of chapter'),
-            ].map((e) => ListTile(
-                  title: Text(e.$2,
+            // ── Sleep timer (shared sheet — see sleep_timer_sheet.dart;
+            // also reachable directly from the moon icon in AudioControls)
+            ListTile(
+              leading: const Icon(Icons.bedtime_outlined,
+                  color: AppColors.textPrimary),
+              title: const Text('Sleep timer',
+                  style:
+                      TextStyle(color: AppColors.textPrimary, fontSize: 14)),
+              subtitle: player.sleepTimer != SleepTimerState.off
+                  ? Text(
+                      switch (player.sleepTimer) {
+                        SleepTimerState.min30 => '30 minutes',
+                        SleepTimerState.min60 => '60 minutes',
+                        SleepTimerState.endOfChapter => 'End of chapter',
+                        SleepTimerState.off => '',
+                      },
                       style: const TextStyle(
-                          color: AppColors.textPrimary, fontSize: 14)),
-                  trailing: player.sleepTimer == e.$1
-                      ? const Icon(Icons.check, color: AppColors.primary)
-                      : null,
-                  onTap: () {
-                    notifier.setSleepTimer(e.$1);
-                    Navigator.of(context).pop();
-                  },
-                )),
+                          color: AppColors.textSecondary, fontSize: 12),
+                    )
+                  : null,
+              trailing: const Icon(Icons.chevron_right,
+                  color: AppColors.textSecondary, size: 20),
+              onTap: () {
+                Navigator.of(context).pop();
+                showSleepTimerSheet(context);
+              },
+            ),
             const Divider(),
             // ── Font size
             const Padding(
@@ -398,117 +410,3 @@ class _QuickThemeButton extends ConsumerWidget {
   }
 }
 
-class _HeaderInfo extends ConsumerWidget {
-  final String itemId;
-  final AppConfig config;
-  final bool compact;
-
-  const _HeaderInfo({
-    required this.itemId,
-    required this.config,
-    this.compact = false,
-  });
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final meta = ref.watch(bookMetaProvider(itemId)).valueOrNull;
-    final offlineBook = ref.watch(offlineStoreProvider).books[itemId];
-    final url = meta?.coverUrl(config.absUrl) ?? '';
-    final headers = {'Authorization': 'Bearer ${config.absToken}'};
-
-    // Short screens (landscape / small phones): compact side-by-side row.
-    if (compact) {
-      return Padding(
-        padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-        child: Row(
-          children: [
-            SizedBox(
-              width: 52,
-              height: 72,
-              child: CoverImage(
-                url: url,
-                localPath: offlineBook?.coverPath,
-                httpHeaders: headers,
-                radius: 8,
-                iconSize: 24,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    meta?.title ?? '',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: AppColors.textPrimary,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    meta?.author ?? '',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: AppColors.textSecondary,
-                      fontSize: 12,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    return Column(
-      children: [
-        Container(
-          width: 100,
-          height: 140,
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(AppColors.cardRadius),
-            boxShadow: const [
-              BoxShadow(
-                  color: Colors.black54, blurRadius: 12, offset: Offset(0, 6)),
-            ],
-          ),
-          child: CoverImage(
-            url: url,
-            localPath: offlineBook?.coverPath,
-            httpHeaders: headers,
-            radius: AppColors.cardRadius,
-            iconSize: 36,
-          ),
-        ),
-        const SizedBox(height: 10),
-        Text(
-          meta?.title ?? '',
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          textAlign: TextAlign.center,
-          style: const TextStyle(
-              color: AppColors.textPrimary,
-              fontSize: 17,
-              fontWeight: FontWeight.w600),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          meta?.author ?? '',
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          textAlign: TextAlign.center,
-          style:
-              const TextStyle(color: AppColors.textSecondary, fontSize: 13),
-        ),
-        const SizedBox(height: 8),
-      ],
-    );
-  }
-}

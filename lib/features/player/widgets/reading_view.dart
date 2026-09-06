@@ -1,7 +1,6 @@
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import '../../../core/providers/config_provider.dart';
 import '../../../core/providers/reader_theme_provider.dart';
@@ -21,6 +20,13 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
   final _scrollController = ScrollController();
   final _cueKeys = <int, GlobalKey>{};
   int? _lastScrolledCue;
+  // True once the user has manually dragged the list away from wherever
+  // auto-follow last put it. While true, auto-follow is suspended (so the
+  // user can freely read ahead or back without being yanked away) and the
+  // floating "jump back to playhead" button appears — same pattern as the
+  // reference screenshot's floating action button, repurposed here for
+  // something this app actually needs since it has no AI chat feature.
+  bool _autoFollowSuspended = false;
 
   @override
   void dispose() {
@@ -31,8 +37,9 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
   GlobalKey _keyFor(int ci) =>
       _cueKeys[ci] ??= GlobalKey(debugLabel: 'cue$ci');
 
-  void _scrollToCue(int ci) {
-    if (ci == _lastScrolledCue) return;
+  void _scrollToCue(int ci, {bool force = false}) {
+    if (_autoFollowSuspended && !force) return;
+    if (ci == _lastScrolledCue && !force) return;
     _lastScrolledCue = ci;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final ctx = _cueKeys[ci]?.currentContext;
@@ -45,6 +52,11 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
         );
       }
     });
+  }
+
+  void _resync(int? cueIndex) {
+    setState(() => _autoFollowSuspended = false);
+    if (cueIndex != null) _scrollToCue(cueIndex, force: true);
   }
 
   @override
@@ -69,26 +81,69 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
         children: [
           if (player.servedFromCache) _CacheBanner(theme: theme),
           Expanded(
-            child: ListView(
-              controller: _scrollController,
-              physics: const BouncingScrollPhysics(),
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 22, vertical: 20),
+            child: Stack(
               children: [
-                for (var ci = 0; ci < player.cues.length; ci++)
-                  _CueParagraph(
-                    key: _keyFor(ci),
-                    cue: player.cues[ci],
-                    cueIndex: ci,
-                    activeCueIndex: cueIndex,
-                    activeWordIndex:
-                        cueIndex == ci ? player.currentWordIndex : null,
-                    fontSize: player.readingFontSize,
-                    isArabic: player.isArabic,
-                    theme: theme,
-                    onWordTap: onWordTap,
+                // Fade the top and bottom edges of the reading area so text
+                // scrolls in/out smoothly instead of hard-clipping — matches
+                // the soft vignette in the reference screenshot.
+                ShaderMask(
+                  shaderCallback: (rect) => const LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.transparent,
+                      Colors.black,
+                      Colors.black,
+                      Colors.transparent,
+                    ],
+                    stops: [0.0, 0.06, 0.92, 1.0],
+                  ).createShader(rect),
+                  blendMode: BlendMode.dstIn,
+                  child: NotificationListener<ScrollNotification>(
+                    onNotification: (n) {
+                      // Only a real user drag suspends auto-follow — the
+                      // programmatic ensureVisible() scroll from
+                      // _scrollToCue must not trip this back on itself.
+                      if (n is ScrollStartNotification &&
+                          n.dragDetails != null &&
+                          !_autoFollowSuspended) {
+                        setState(() => _autoFollowSuspended = true);
+                      }
+                      return false;
+                    },
+                    child: ListView(
+                      controller: _scrollController,
+                      physics: const BouncingScrollPhysics(),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 22, vertical: 28),
+                      children: [
+                        for (var ci = 0; ci < player.cues.length; ci++)
+                          _CueParagraph(
+                            key: _keyFor(ci),
+                            cue: player.cues[ci],
+                            cueIndex: ci,
+                            activeCueIndex: cueIndex,
+                            activeWordIndex:
+                                cueIndex == ci ? player.currentWordIndex : null,
+                            fontSize: player.readingFontSize,
+                            isArabic: player.isArabic,
+                            theme: theme,
+                            onWordTap: onWordTap,
+                          ),
+                        const SizedBox(height: 40),
+                      ],
+                    ),
                   ),
-                const SizedBox(height: 40),
+                ),
+                if (_autoFollowSuspended)
+                  Positioned(
+                    right: 16,
+                    bottom: 16,
+                    child: _ResyncButton(
+                      theme: theme,
+                      onTap: () => _resync(cueIndex),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -187,6 +242,42 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
   }
 }
 
+// ── Resync-to-playhead floating button ────────────────────────────────────
+
+class _ResyncButton extends StatelessWidget {
+  const _ResyncButton({required this.theme, required this.onTap});
+  final ReaderThemeData theme;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(28),
+        child: Container(
+          width: 48,
+          height: 48,
+          decoration: BoxDecoration(
+            color: theme.isDark ? Colors.white : theme.text,
+            shape: BoxShape.circle,
+            boxShadow: const [
+              BoxShadow(
+                  color: Colors.black38, blurRadius: 10, offset: Offset(0, 3)),
+            ],
+          ),
+          child: Icon(
+            Icons.center_focus_strong_rounded,
+            color: theme.isDark ? Colors.black87 : theme.background,
+            size: 22,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // ── Offline cache banner ──────────────────────────────────────────────────
 
 class _CacheBanner extends StatelessWidget {
@@ -228,6 +319,11 @@ class _CacheBanner extends StatelessWidget {
 // line breaks and word positions stay put). Past words get a dim color
 // via TextSpan.color; the active word gets a WidgetSpan with a
 // background-color Container.
+//
+// The currently-playing cue additionally sits inside a soft rounded
+// gradient card (see _CueParagraph.build below) — the sentence-level
+// highlight from the reference screenshot, layered on top of the
+// existing per-word highlight rather than replacing it.
 
 class _CueParagraph extends StatelessWidget {
   const _CueParagraph({
@@ -256,21 +352,15 @@ class _CueParagraph extends StatelessWidget {
     final isCurrent = activeCueIndex == cueIndex;
     final isPastCue = activeCueIndex != null && cueIndex < activeCueIndex!;
 
-    final baseStyle = GoogleFonts.lora(
-      fontSize: fontSize,
+    final baseStyle = AppTheme.readingStyle(size: fontSize).copyWith(
       height: 1.85,
       color: theme.text,
-      fontWeight: FontWeight.w400,
     );
     final dimStyle = baseStyle.copyWith(
       color: theme.text.withValues(alpha: theme.dimOpacity),
     );
-    final activeTextStyle = GoogleFonts.lora(
-      fontSize: fontSize,
-      height: 1.85,
-      color: theme.highlightText,
-      fontWeight: FontWeight.w700,
-    );
+    final activeTextStyle = AppTheme.readingStyle(size: fontSize, bold: true)
+        .copyWith(height: 1.85, color: theme.highlightText);
 
     // Build inline spans. A WidgetSpan for the active word so it gets
     // the amber pill background, TextSpan for everything else.
@@ -311,13 +401,33 @@ class _CueParagraph extends StatelessWidget {
       }
     }
 
+    final paragraph = Text.rich(
+      TextSpan(children: spans),
+      textDirection: isArabic ? TextDirection.rtl : TextDirection.ltr,
+      textAlign: isArabic ? TextAlign.right : TextAlign.justify,
+    );
+
     return Padding(
       padding: const EdgeInsets.only(bottom: 18),
-      child: Text.rich(
-        TextSpan(children: spans),
-        textDirection: isArabic ? TextDirection.rtl : TextDirection.ltr,
-        textAlign: isArabic ? TextAlign.right : TextAlign.justify,
-      ),
+      child: isCurrent
+          ? AnimatedContainer(
+              duration: const Duration(milliseconds: 250),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(18),
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    theme.highlightBg.withValues(alpha: theme.isDark ? 0.22 : 0.16),
+                    theme.highlightBg.withValues(alpha: theme.isDark ? 0.06 : 0.05),
+                  ],
+                ),
+              ),
+              child: paragraph,
+            )
+          : paragraph,
     );
   }
 }

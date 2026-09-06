@@ -212,36 +212,33 @@ class OfflineController extends Notifier<OfflineStoreState> {
 
       for (final f in pending) {
         if (!_active.contains(itemId)) return; // cancelled via remove()
-        // ABS serves these files; only accept real 2xx responses so an error
-        // page is never written to disk as a fake audio file.
         final savePath = '${dir.path}/${f.offlineFilename}';
         final url = '${config.absUrl}/api/items/$itemId/file/${f.ino}';
 
         Exception? lastError;
         // Two retries on transient connection errors — phone WiFi to a LAN
         // server occasionally drops mid-transfer on long downloads.
+        // _downloadFileResumable preserves whatever bytes made it to disk
+        // on failure, and each attempt (including ones from a previous,
+        // fully separate run of this method — e.g. after a crash) picks
+        // up from those bytes via an HTTP Range request instead of
+        // starting the file over from zero.
         for (var attempt = 0; attempt < 3; attempt++) {
           try {
-            await abs.download(
-              url,
-              savePath,
+            await _downloadFileResumable(
+              abs: abs,
+              url: url,
+              savePath: savePath,
               cancelToken: token,
-              options: Options(
-                receiveTimeout: const Duration(minutes: 10),
-                validateStatus: (s) => s != null && s >= 200 && s < 300,
+              onProgress: (fp) => _setProgress(
+                itemId,
+                DownloadProgress(
+                  totalFiles: totalFiles,
+                  completedFiles: completed,
+                  fileProgress: fp,
+                  currentIno: f.ino,
+                ),
               ),
-              onReceiveProgress: (received, total) {
-                final fp = total <= 0 ? 0.0 : (received / total).clamp(0.0, 1.0);
-                _setProgress(
-                  itemId,
-                  DownloadProgress(
-                    totalFiles: totalFiles,
-                    completedFiles: completed,
-                    fileProgress: fp,
-                    currentIno: f.ino,
-                  ),
-                );
-              },
             );
             lastError = null;
             break;
@@ -361,6 +358,118 @@ class OfflineController extends Notifier<OfflineStoreState> {
     } finally {
       _active.remove(itemId);
       _cancelTokens.remove(itemId);
+    }
+  }
+
+  /// Downloads [url] to [savePath], resuming from whatever bytes are
+  /// already on disk instead of starting over.
+  ///
+  /// Audiobook files are large (often 100s of MB for a single chapter or
+  /// whole-book file) over a home WiFi link to a self-hosted server that
+  /// drops connections fairly often — losing all progress on every retry
+  /// is expensive and is exactly what this avoids.
+  ///
+  /// How it works: if a partial file already exists, a HEAD request first
+  /// confirms the server (a) actually supports Range requests
+  /// (`Accept-Ranges: bytes`) and (b) tells us the true full size, so we
+  /// never blindly trust a partial file left over from an old/different
+  /// version of the source file. Only then do we request
+  /// `Range: bytes=<existing>-` and append to the file instead of
+  /// overwriting it. If the server ignores Range and would send the whole
+  /// file again (status 200 instead of 206), that's caught immediately —
+  /// the partial bytes are wiped and it becomes a normal full download —
+  /// so a non-Range-supporting server can never corrupt the file by
+  /// having the full body appended after existing partial bytes.
+  Future<void> _downloadFileResumable({
+    required Dio abs,
+    required String url,
+    required String savePath,
+    required CancelToken cancelToken,
+    required void Function(double fileProgress) onProgress,
+  }) async {
+    final file = File(savePath);
+    final existingBytes = await file.exists() ? await file.length() : 0;
+
+    var resume = false;
+    var expectedTotal = 0;
+
+    if (existingBytes > 0) {
+      try {
+        final head = await abs.head(
+          url,
+          options: Options(
+            sendTimeout: const Duration(seconds: 10),
+            receiveTimeout: const Duration(seconds: 10),
+            validateStatus: (s) => s != null && s < 500,
+          ),
+        );
+        final acceptsRanges =
+            head.headers.value('accept-ranges')?.toLowerCase() == 'bytes';
+        expectedTotal =
+            int.tryParse(head.headers.value('content-length') ?? '') ?? 0;
+
+        if (expectedTotal > 0 && existingBytes >= expectedTotal) {
+          // Already fully there (e.g. this is a leftover from a run that
+          // completed the write but crashed before the DB mark landed).
+          // Nothing left to transfer.
+          return;
+        }
+        resume = acceptsRanges && expectedTotal > existingBytes;
+      } catch (_) {
+        // HEAD failed (server briefly down, etc.) — fall through and
+        // treat this like a fresh file below; safer than guessing.
+      }
+      if (!resume) {
+        // Either the server doesn't support Range, or the HEAD check
+        // failed/disagreed with what's on disk — discard the partial
+        // bytes rather than risk a corrupt append.
+        await file.delete();
+      }
+    }
+
+    final baseBytes = resume ? existingBytes : 0;
+    final response = await abs.download(
+      url,
+      savePath,
+      cancelToken: cancelToken,
+      deleteOnError: false, // keep partial bytes on failure so the NEXT
+      // attempt (whether the retry loop above, or a "Download" tap the
+      // user makes tomorrow) can resume instead of restarting.
+      fileAccessMode: resume ? FileAccessMode.append : FileAccessMode.write,
+      options: Options(
+        receiveTimeout: const Duration(minutes: 10),
+        headers: resume ? {'Range': 'bytes=$baseBytes-'} : null,
+        validateStatus: (s) => s != null && s >= 200 && s < 300,
+      ),
+      onReceiveProgress: (received, total) {
+        final grandTotal = expectedTotal > 0 ? expectedTotal : (total + baseBytes);
+        final fp = grandTotal <= 0
+            ? 0.0
+            : ((baseBytes + received) / grandTotal).clamp(0.0, 1.0);
+        onProgress(fp);
+      },
+    );
+
+    // Defensive check: if we asked to resume but the server sent a full
+    // 200 response anyway (some proxies/CDNs silently drop Range), the
+    // append just corrupted the file — the on-disk size will be roughly
+    // double what's expected. Catch it here rather than shipping a
+    // corrupt audio file into the library.
+    if (resume && response.statusCode == 200) {
+      await file.delete();
+      throw DioException(
+        requestOptions: response.requestOptions,
+        message: 'Server ignored Range header; restarting this file',
+        type: DioExceptionType.badResponse,
+      );
+    }
+
+    if (!await file.exists() || await file.length() == 0) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        message: 'Downloaded file was empty',
+        type: DioExceptionType.badResponse,
+      );
     }
   }
 

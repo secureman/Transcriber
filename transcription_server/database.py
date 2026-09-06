@@ -356,3 +356,16 @@ async def get_jobs_for_book(book_id: str) -> list[dict]:
         ) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def job_status_counts() -> dict[str, int]:
+    """Counts of transcription_jobs rows grouped by status, for a one-line
+    startup sanity check — see main.py's lifespan handler.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT status, COUNT(*) FROM transcription_jobs "
+            "GROUP BY status"
+        ) as cur:
+            rows = await cur.fetchall()
+    return {status: count for status, count in rows}

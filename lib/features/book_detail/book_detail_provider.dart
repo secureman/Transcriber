@@ -43,18 +43,44 @@ final bookDetailProvider =
   final backend = ref.read(backendClientProvider);
   final abs = ref.read(absClientProvider);
 
+  // The transcription backend's own BookMeta proxy (below) has no concept
+  // of listening progress — it's scoped to chapters/title/etc for
+  // transcription purposes. Whichever source below wins, top up the
+  // result with ABS's real userMediaProgress afterward so the "Continue"
+  // button always resumes into the chapter the user actually last
+  // listened to (possibly on a different device), not a stale local
+  // guess. Best-effort: if this fails (server briefly down), callers
+  // still fall back to the locally-remembered chapter — see
+  // book_detail_screen.dart.
+  Future<AbsItem> withServerProgress(AbsItem book) async {
+    if (book.resumeSeconds != null) return book; // already has it
+    try {
+      final res = await abs.get('/api/items/$itemId?expanded=1');
+      if (res.statusCode == 200) {
+        final fresh = AbsItem.fromJson(res.data as Map<String, dynamic>);
+        return book.copyWithResume(fresh.resumeSeconds);
+      }
+    } catch (_) {
+      // Server unreachable — return book as-is, no progress attached.
+    }
+    return book;
+  }
+
   try {
     final res = await backend.get('/api/metadata/$itemId');
     if (res.statusCode == 200) {
       final data = res.data;
       if (data is Map<String, dynamic>) {
-        if (data['media'] != null) return AbsItem.fromJson(data);
+        if (data['media'] != null) {
+          return await withServerProgress(AbsItem.fromJson(data));
+        }
         if (data['item'] is Map<String, dynamic>) {
-          return AbsItem.fromJson(data['item'] as Map<String, dynamic>);
+          return await withServerProgress(
+              AbsItem.fromJson(data['item'] as Map<String, dynamic>));
         }
         // Backend BookMeta shape: {item_id, title, author, cover_url, duration, chapters}
         if (data['item_id'] is String && data['chapters'] is List) {
-          return AbsItem.fromBackendMeta(data);
+          return await withServerProgress(AbsItem.fromBackendMeta(data));
         }
       }
       throw const FormatException('Unrecognized metadata shape');
@@ -64,7 +90,7 @@ final bookDetailProvider =
   }
 
   try {
-    final absRes = await abs.get('/api/items/$itemId');
+    final absRes = await abs.get('/api/items/$itemId?expanded=1');
     if (absRes.statusCode == 200) {
       return AbsItem.fromJson(absRes.data as Map<String, dynamic>);
     }

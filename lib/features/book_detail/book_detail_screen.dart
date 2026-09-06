@@ -39,7 +39,9 @@ class BookDetailScreen extends ConsumerWidget {
           data: (book) {
             final config = ref.watch(configProvider);
             final prefs = ref.watch(sharedPrefsProvider);
-            final lastPlayed = AppConfig.lastPlayedChapter(prefs, itemId) ?? 0;
+            final lastPlayed = book.resumePosition()?.chapterIndex ??
+                AppConfig.lastPlayedChapter(prefs, itemId) ??
+                0;
             final statuses = jobsAsync.valueOrNull ?? const {};
             final active = activeJobsAsync.valueOrNull ?? const [];
 

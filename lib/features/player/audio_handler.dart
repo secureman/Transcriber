@@ -125,6 +125,16 @@ class AudiobookAudioHandler extends BaseAudioHandler {
     await player.seek(end != null && target > end ? end : target);
   }
 
+  /// Forward skip uses a longer interval than the back skip (15s) — a
+  /// common asymmetry in audiobook players: overshoot-and-rewind-15 is
+  /// more common than needing to jump far ahead, so a bigger forward jump
+  /// saves more taps on average.
+  Future<void> skipForward30() async {
+    final target = player.position + const Duration(seconds: 30);
+    final end = player.duration;
+    await player.seek(end != null && target > end ? end : target);
+  }
+
   Future<void> skipBackward15() async {
     final target = player.position - const Duration(seconds: 15);
     await player.seek(target < Duration.zero ? Duration.zero : target);

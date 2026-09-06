@@ -75,6 +75,11 @@ class AbsItem {
   final String? language;
   final String coverPath;
   final double progress; // 0..1 user progress from ABS
+  /// Exact whole-book-timeline resume position in seconds, from ABS's
+  /// `userMediaProgress.currentTime` (only present when the item was
+  /// fetched with `?expanded=1`). Null when ABS reports no progress yet.
+  final double? resumeSeconds;
+  final String? narratorName;
 
   const AbsItem({
     required this.id,
@@ -88,6 +93,8 @@ class AbsItem {
     this.language,
     this.coverPath = '',
     this.progress = 0,
+    this.resumeSeconds,
+    this.narratorName,
   });
 
   bool get isArabic =>
@@ -120,6 +127,41 @@ class AbsItem {
     return audioFiles.last.ino;
   }
 
+  /// Maps [resumeSeconds] onto a specific chapter, for callers that want
+  /// to know "which chapter (and how far into it) should we resume into"
+  /// without duplicating the chapter-range scan themselves. Returns null
+  /// when there's no progress yet, or it's past the end of the book.
+  ({int chapterIndex, double offsetSeconds})? resumePosition() {
+    final target = resumeSeconds;
+    if (target == null || target <= 0 || chapters.isEmpty) return null;
+    for (var i = 0; i < chapters.length; i++) {
+      final ch = chapters[i];
+      if (target >= ch.start && target < ch.end) {
+        return (chapterIndex: i, offsetSeconds: target - ch.start);
+      }
+    }
+    return null;
+  }
+
+  /// Copies this item with a freshly-fetched resume position. Used when the
+  /// primary metadata source (the transcription backend's BookMeta proxy)
+  /// has no progress field of its own — see bookDetailProvider.
+  AbsItem copyWithResume(double? resumeSeconds) => AbsItem(
+        id: id,
+        mediaId: mediaId,
+        title: title,
+        author: author,
+        duration: duration,
+        chapters: chapters,
+        audioFiles: audioFiles,
+        seriesName: seriesName,
+        language: language,
+        coverPath: coverPath,
+        progress: progress,
+        resumeSeconds: resumeSeconds,
+        narratorName: narratorName,
+      );
+
   factory AbsItem.fromJson(Map<String, dynamic> json) {
     final media = json['media'] as Map<String, dynamic>? ?? {};
     final metadata = media['metadata'] as Map<String, dynamic>? ?? {};
@@ -128,6 +170,11 @@ class AbsItem {
     final seriesList = metadata['seriesName'] is String
         ? null
         : metadata['series'] as List<dynamic>?;
+    // Only present when fetched with ?expanded=1 — see LibraryItemController
+    // findOne() in the ABS server source, which gates this behind that
+    // query param via req.user.getOldMediaProgress(...).
+    final mediaProgress = json['userMediaProgress'] as Map<String, dynamic>?;
+    final narrators = metadata['narrators'] as List<dynamic>?;
 
     String? seriesName;
     if (metadata['seriesName'] is String) {
@@ -155,6 +202,10 @@ class AbsItem {
           (media['coverPath'] as String?) ?? (json['coverPath'] as String?) ?? '',
       progress:
           (media['progress'] as num?)?.toDouble() ?? (json['progress'] as num?)?.toDouble() ?? 0,
+      resumeSeconds: (mediaProgress?['currentTime'] as num?)?.toDouble(),
+      narratorName: (narrators != null && narrators.isNotEmpty)
+          ? narrators.first as String?
+          : null,
     );
   }
 

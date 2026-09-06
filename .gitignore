@@ -44,3 +44,12 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 .env
+
+# Transcription server's own runtime data (DB, caches, logs) — this must
+# never be committed. A stray committed transcriptions.db here previously
+# caused re-transcription of already-done chapters whenever the server's
+# data-dir resolution fell back to this folder — see paths.py.
+transcription_server/*.db
+transcription_server/vtt_cache/
+transcription_server/tmp_audio/
+transcription_server/logs/

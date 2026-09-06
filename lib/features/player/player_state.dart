@@ -21,6 +21,12 @@ class PlayerState {
   final bool finished; // true after the final chapter completes
   final Duration position;
   final Duration chapterDuration;
+  // Whole-book context for the player screen's "time left in book" display
+  // (see chapter_scrubber.dart) — set alongside the internal ABS-sync
+  // bookkeeping in player_provider.dart's _loadAudio, using the same
+  // chapter.start value so the two stay consistent.
+  final double chapterStartInBook; // seconds
+  final double bookDurationSeconds;
   final double speed;
   final VttStatus vttStatus;
   final List<VttCue> cues;
@@ -42,6 +48,8 @@ class PlayerState {
     this.finished = false,
     this.position = Duration.zero,
     this.chapterDuration = Duration.zero,
+    this.chapterStartInBook = 0,
+    this.bookDurationSeconds = 0,
     this.speed = 1.0,
     this.vttStatus = VttStatus.loading,
     this.cues = const [],
@@ -71,6 +79,8 @@ class PlayerState {
     bool? finished,
     Duration? position,
     Duration? chapterDuration,
+    double? chapterStartInBook,
+    double? bookDurationSeconds,
     double? speed,
     VttStatus? vttStatus,
     List<VttCue>? cues,
@@ -93,6 +103,8 @@ class PlayerState {
         finished: finished ?? this.finished,
         position: position ?? this.position,
         chapterDuration: chapterDuration ?? this.chapterDuration,
+        chapterStartInBook: chapterStartInBook ?? this.chapterStartInBook,
+        bookDurationSeconds: bookDurationSeconds ?? this.bookDurationSeconds,
         speed: speed ?? this.speed,
         vttStatus: vttStatus ?? this.vttStatus,
         cues: cues ?? this.cues,
@@ -130,7 +142,7 @@ final bookMetaProvider = FutureProvider.family<AbsItem?, String>(
     }
     final abs = ref.read(absClientProvider);
     try {
-      final res = await abs.get('/api/items/$itemId');
+      final res = await abs.get('/api/items/$itemId?expanded=1');
       if (res.statusCode != 200) return null;
       return AbsItem.fromJson(res.data as Map<String, dynamic>);
     } catch (_) {

@@ -5,7 +5,6 @@ import 'package:go_router/go_router.dart';
 import '../../../core/offline/offline_provider.dart';
 import '../../../core/providers/config_provider.dart';
 import '../../../core/theme/app_theme.dart';
-import '../../../core/utils/duration_ext.dart';
 import '../../../core/widgets/cover_image.dart';
 import '../player_provider.dart';
 import '../player_state.dart';
@@ -13,6 +12,9 @@ import '../player_state.dart';
 /// Compact bar shown at the bottom of the shell screens while something is
 /// loaded in the player. Tap to reopen the full player; playback continues
 /// because [playerProvider] is app-scoped.
+///
+/// Styled as a floating rounded pill (per the reference screenshot) rather
+/// than a full-bleed bar — sits with margin just above the bottom nav.
 class MiniPlayerBar extends ConsumerWidget {
   const MiniPlayerBar({super.key});
 
@@ -34,9 +36,10 @@ class MiniPlayerBar extends ConsumerWidget {
           child: child,
         ),
         child: show
-            ? _MiniBar(
+            ? Padding(
                 key: const ValueKey('mini-player'),
-                player: player,
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                child: _MiniBar(player: player),
               )
             : const SizedBox.shrink(key: ValueKey('mini-player-hidden')),
       ),
@@ -47,7 +50,7 @@ class MiniPlayerBar extends ConsumerWidget {
 class _MiniBar extends ConsumerWidget {
   final PlayerState player;
 
-  const _MiniBar({super.key, required this.player});
+  const _MiniBar({required this.player});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -67,6 +70,10 @@ class _MiniBar extends ConsumerWidget {
 
     return Material(
       color: AppColors.surface,
+      borderRadius: BorderRadius.circular(18),
+      elevation: 8,
+      shadowColor: Colors.black54,
+      clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: () => context.push('/player/$itemId/${player.chapterIndex}'),
         child: Column(
@@ -79,19 +86,19 @@ class _MiniBar extends ConsumerWidget {
               valueColor: const AlwaysStoppedAnimation(AppColors.primary),
             ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+              padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
               child: Row(
                 children: [
                   SizedBox(
-                    width: 42,
-                    height: 42,
+                    width: 44,
+                    height: 44,
                     child: CoverImage(
                       url: coverUrl,
                       localPath: offlineBook?.coverPath,
                       httpHeaders: {
                         'Authorization': 'Bearer ${config.absToken}',
                       },
-                      radius: 8,
+                      radius: 10,
                       iconSize: 22,
                     ),
                   ),
@@ -99,34 +106,42 @@ class _MiniBar extends ConsumerWidget {
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
                       children: [
                         Text(
                           meta?.title ??
-                              (player.audioReady
-                                  ? 'Audiobook'
-                                  : 'Loading…'),
+                              (player.audioReady ? 'Audiobook' : 'Loading…'),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
                             color: AppColors.textPrimary,
-                            fontSize: 13,
+                            fontSize: 13.5,
                             fontWeight: FontWeight.w600,
                           ),
                         ),
-                        const SizedBox(height: 2),
-                        Text(
-                          'Chapter ${player.chapterIndex + 1} · '
-                          '${player.position.mmss} / '
-                          '${player.chapterDuration.mmss}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: AppColors.textSecondary,
-                            fontSize: 11,
+                        if (meta?.author != null && meta!.author.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 2),
+                            child: Text(
+                              meta.author,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: AppColors.textSecondary,
+                                fontSize: 11.5,
+                              ),
+                            ),
                           ),
-                        ),
                       ],
                     ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.replay_rounded),
+                    color: AppColors.textPrimary,
+                    tooltip: 'Back 15s',
+                    onPressed: player.audioReady
+                        ? () => notifier.skipBackward15()
+                        : null,
                   ),
                   IconButton(
                     icon: Icon(
@@ -139,15 +154,6 @@ class _MiniBar extends ConsumerWidget {
                     onPressed: player.audioReady
                         ? () => notifier.togglePlayPause()
                         : null,
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.skip_next_rounded),
-                    color: AppColors.textPrimary,
-                    tooltip: 'Next chapter',
-                    onPressed:
-                        player.isOnLastChapter || !player.audioReady
-                            ? null
-                            : () => notifier.nextChapter(),
                   ),
                 ],
               ),
