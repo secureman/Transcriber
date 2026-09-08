@@ -8,9 +8,10 @@ import '../player_state.dart';
 import 'chapter_sheet.dart';
 
 
-/// Chapter-name pill + scrubber + Audiobookshelf-style time rows.
-/// The first row is the whole-book clock and the second is the current chapter
-/// clock. Both clocks show listening time, so they respect playback speed.
+/// Chapter-name pill + two stacked scrubbers, Audiobookshelf-style: the top
+/// slider + row track the whole audiobook, the bottom slider + row track
+/// the current chapter. Both clocks show listening time, so both respect
+/// playback speed.
 class ChapterScrubber extends ConsumerWidget {
   const ChapterScrubber({super.key});
 
@@ -21,16 +22,29 @@ class ChapterScrubber extends ConsumerWidget {
     final meta = player.itemId == null
         ? null
         : ref.watch(bookMetaProvider(player.itemId!)).valueOrNull;
-    final maxMs = player.chapterDuration.inMilliseconds;
-    final value = player.position.inMilliseconds
-        .clamp(0, maxMs == 0 ? 1 : maxMs)
-        .toDouble();
     final speed = player.speed;
+
+    // -- Chapter-level (bottom) -----------------------------------------
+    final chapterMaxMs = player.chapterDuration.inMilliseconds;
+    final chapterValue = player.position.inMilliseconds
+        .clamp(0, chapterMaxMs == 0 ? 1 : chapterMaxMs)
+        .toDouble();
+    final chapterElapsed = atPlaybackSpeed(
+      player.position.isNegative ? Duration.zero : player.position,
+      speed,
+    );
+    final chapterTotal = atPlaybackSpeed(player.chapterDuration, speed);
+    final chapterRemaining = chapterTotal - chapterElapsed;
+
+    // -- Book-level (top) -------------------------------------------------
+    final bookMaxMs = (player.bookDurationSeconds * 1000).round();
+    final elapsedInBookSeconds =
+        player.chapterStartInBook + player.position.inMilliseconds / 1000.0;
+    final bookValue = (elapsedInBookSeconds * 1000)
+        .clamp(0, bookMaxMs == 0 ? 1 : bookMaxMs)
+        .toDouble();
     final bookElapsed = atPlaybackSpeed(
-      (player.chapterStartInBook + player.position.inMilliseconds / 1000.0)
-          .clamp(0, double.infinity)
-          .toDouble()
-          .asDuration,
+      elapsedInBookSeconds.clamp(0, double.infinity).toDouble().asDuration,
       speed,
     );
     final bookTotal = atPlaybackSpeed(
@@ -38,12 +52,8 @@ class ChapterScrubber extends ConsumerWidget {
       speed,
     );
     final bookRemaining = bookTotal - bookElapsed;
-    final chapterElapsed = atPlaybackSpeed(
-      player.position.isNegative ? Duration.zero : player.position,
-      speed,
-    );
-    final chapterTotal = atPlaybackSpeed(player.chapterDuration, speed);
-    final chapterRemaining = chapterTotal - chapterElapsed;
+    final hasBookDuration = player.bookDurationSeconds > 0;
+
     final chapterTitle = (meta != null &&
             player.chapterIndex >= 0 &&
             player.chapterIndex < meta.chapters.length)
@@ -86,23 +96,14 @@ class ChapterScrubber extends ConsumerWidget {
             ],
           ),
         ),
-        const SizedBox(height: 4),
-        SliderTheme(
-          data: SliderTheme.of(context).copyWith(
-            trackHeight: 2,
-            thumbColor: AppColors.primary,
-            activeTrackColor: AppColors.primary,
-            inactiveTrackColor: AppColors.surfaceElevated,
-            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-            overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
-          ),
-          child: Slider(
-            value: value,
-            max: maxMs == 0 ? 1 : maxMs.toDouble(),
-            onChanged: maxMs == 0
-                ? null
-                : (v) => notifier.seekTo(Duration(milliseconds: v.toInt())),
-          ),
+        const SizedBox(height: 2),
+        // -- Top: whole-book scrubber ----------------------------------
+        _ScrubberSlider(
+          value: bookValue,
+          max: bookMaxMs == 0 ? 1 : bookMaxMs.toDouble(),
+          onChanged: (!hasBookDuration || meta == null || meta.chapters.isEmpty)
+              ? null
+              : (v) => notifier.seekToBookPosition(v / 1000.0),
         ),
         _TimeRow(
           label: 'Overall',
@@ -110,7 +111,15 @@ class ChapterScrubber extends ConsumerWidget {
           remaining: bookRemaining.isNegative ? Duration.zero : bookRemaining,
           total: bookTotal,
         ),
-        const SizedBox(height: 3),
+        const SizedBox(height: 6),
+        // -- Bottom: current-chapter scrubber ---------------------------
+        _ScrubberSlider(
+          value: chapterValue,
+          max: chapterMaxMs == 0 ? 1 : chapterMaxMs.toDouble(),
+          onChanged: chapterMaxMs == 0
+              ? null
+              : (v) => notifier.seekTo(Duration(milliseconds: v.toInt())),
+        ),
         _TimeRow(
           label: 'Chapter',
           elapsed: chapterElapsed,
@@ -119,6 +128,39 @@ class ChapterScrubber extends ConsumerWidget {
           total: chapterTotal,
         ),
       ],
+    );
+  }
+}
+
+/// Shared slider chrome for both the book-level and chapter-level scrubbers,
+/// so the two read as a matched pair (like Audiobookshelf's stacked bars).
+class _ScrubberSlider extends StatelessWidget {
+  const _ScrubberSlider({
+    required this.value,
+    required this.max,
+    required this.onChanged,
+  });
+
+  final double value;
+  final double max;
+  final ValueChanged<double>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return SliderTheme(
+      data: SliderTheme.of(context).copyWith(
+        trackHeight: 2,
+        thumbColor: AppColors.primary,
+        activeTrackColor: AppColors.primary,
+        inactiveTrackColor: AppColors.surfaceElevated,
+        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+        overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+      ),
+      child: Slider(
+        value: value.clamp(0, max),
+        max: max,
+        onChanged: onChanged,
+      ),
     );
   }
 }

@@ -127,6 +127,28 @@ class AbsItem {
     return audioFiles.last.ino;
   }
 
+  /// Maps an arbitrary whole-book [target] position (seconds) onto a
+  /// specific chapter + in-chapter offset. Used by the book-level scrubber
+  /// (see chapter_scrubber.dart) to translate a drag on the top/overall
+  /// slider into a chapter switch + seek. Clamps to the first/last chapter
+  /// when [target] falls outside the book's range.
+  ({int chapterIndex, double offsetSeconds}) chapterForBookPosition(
+    double target,
+  ) {
+    if (chapters.isEmpty) return (chapterIndex: 0, offsetSeconds: 0);
+    for (var i = 0; i < chapters.length; i++) {
+      final ch = chapters[i];
+      if (target >= ch.start && target < ch.end) {
+        return (chapterIndex: i, offsetSeconds: target - ch.start);
+      }
+    }
+    if (target < chapters.first.start) {
+      return (chapterIndex: 0, offsetSeconds: 0);
+    }
+    final last = chapters.length - 1;
+    return (chapterIndex: last, offsetSeconds: chapters[last].duration);
+  }
+
   /// Maps [resumeSeconds] onto a specific chapter, for callers that want
   /// to know "which chapter (and how far into it) should we resume into"
   /// without duplicating the chapter-range scan themselves. Returns null

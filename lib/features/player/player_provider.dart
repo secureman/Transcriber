@@ -548,6 +548,23 @@ class PlayerController extends Notifier<PlayerState> {
         .read(audioHandlerProvider)
         .seek(clipRelative.isNegative ? Duration.zero : clipRelative);
   }
+  /// Seeks against the whole-book timeline (the top/overall slider in
+  /// chapter_scrubber.dart), switching chapters first if [targetSeconds]
+  /// lands outside the currently-loaded chapter.
+  Future<void> seekToBookPosition(double targetSeconds) async {
+    final itemId = state.itemId;
+    if (itemId == null) return;
+    final meta = ref.read(bookMetaProvider(itemId)).valueOrNull;
+    if (meta == null || meta.chapters.isEmpty) return;
+    final target = meta.chapterForBookPosition(targetSeconds);
+    if (target.chapterIndex == state.chapterIndex) {
+      await seekTo(target.offsetSeconds.asDuration);
+    } else {
+      await switchChapter(target.chapterIndex);
+      await seekTo(target.offsetSeconds.asDuration);
+    }
+  }
+
   Future<void> skipForward15() => ref.read(audioHandlerProvider).skipForward15();
   Future<void> skipForward30() => ref.read(audioHandlerProvider).skipForward30();
   Future<void> skipBackward15() => ref.read(audioHandlerProvider).skipBackward15();
