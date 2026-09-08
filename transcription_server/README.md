@@ -37,9 +37,17 @@ files for the EReader Flutter app.
 ## Behaviour
 
 - Chapters already `done` are never re-transcribed (cache: `vtt_cache/{item_id}/chapter_N.vtt`).
-- `MAX_CONCURRENT_JOBS` (default 2) Groq calls in parallel via semaphore.
-- Chapters > 24 MB are split into ~20 MB chunks with 8s overlap; overlapping words are trimmed on merge.
-- Chapters spanning multiple audio files are extracted piecewise and concatenated with ffmpeg.
+- `MAX_CONCURRENT_JOBS` (default 2) chapters run in parallel (CPU-bound ffmpeg work); Groq API
+  calls are bounded separately by `MAX_CONCURRENT_GROQ` (default 4, global) and
+  `MAX_CONCURRENT_CHUNKS` (default 4, per chapter).
+- Chunks are cut in a **single ffmpeg pass** straight to Groq-ready 16 kHz mono
+  (`GROQ_CHUNK_SIZE_MB`, default ~10 MB ≈ 20 min of 64 kbps audio) and uploaded **in parallel**;
+  overlapping words (8 s overlap) are trimmed on merge. This replaces the old
+  extract → concat → re-split pipeline (3 encode passes → 1).
+- Chapters spanning multiple audio files have their parts extracted concurrently and chunked
+  per part — no intermediate concat file.
+- Model is configurable via `GROQ_MODEL` (default `whisper-large-v3-turbo`, ~8× faster than
+  `whisper-large-v3` with a small accuracy tradeoff). Rate-limit retries honor `Retry-After`.
 - Tmp audio is cleaned up after every job (success or failure).
 
 ## Hosting on Termux (Android)

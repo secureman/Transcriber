@@ -33,7 +33,12 @@ async def _claim_job() -> str | None:
 
 
 async def _worker() -> None:
-    """Loops, claiming and running pending jobs until told to stop."""
+    """Loops, claiming and running pending jobs until told to stop.
+
+    Bounded by MAX_CONCURRENT_JOBS workers (CPU-bound ffmpeg work). Groq
+    API concurrency is bounded separately inside groq_client — no shared
+    semaphore here anymore.
+    """
     while True:
         job_id = await _claim_job()
         if job_id is None:
@@ -43,8 +48,7 @@ async def _worker() -> None:
         logger.info("Worker picked up job %s (in-flight: %d)",
                     job_id, len(_inflight))
         try:
-            async with job_runner.semaphore:
-                await job_runner._execute_job(job_id)
+            await job_runner._execute_job(job_id)
         except Exception as e:  # noqa: BLE001
             # _execute_job already catches its own exceptions, so this only
             # fires for truly unexpected errors (e.g. programming bugs).

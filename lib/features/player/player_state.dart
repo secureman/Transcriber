@@ -12,6 +12,12 @@ enum VttStatus { loading, ready, notFound, transcribing, error }
 
 enum SleepTimerState { off, min30, min60, endOfChapter }
 
+/// SharedPreferences key for the last-used playback speed. Kept here (not in
+/// the provider) so both the player controller and widgets that display
+/// speed-adjusted times without playing anything (e.g. library list tiles)
+/// can reference the same key.
+const kPlaybackSpeedKey = 'playback_speed';
+
 class PlayerState {
   final String? itemId;
   final int chapterIndex;
@@ -37,7 +43,12 @@ class PlayerState {
   final double readingFontSize;
   final bool isArabic;
   final double transcribeProgress; // 0..1 from the backend's 202 vtt response
-  final bool servedFromCache;  // true when VTT was served from local cache (server offline)
+  final bool
+  servedFromCache; // true when VTT was served from local cache (server offline)
+  /// Immersive read-along mode: hide the scrubber/controls chrome and the
+  /// system bars so the transcript fills the screen (see player_screen.dart).
+  /// Session-only — deliberately not persisted across restarts.
+  final bool fullscreenReader;
 
   const PlayerState({
     this.itemId,
@@ -61,6 +72,7 @@ class PlayerState {
     this.isArabic = false,
     this.transcribeProgress = 0,
     this.servedFromCache = false,
+    this.fullscreenReader = false,
   });
 
   bool get hasVtt => vttStatus == VttStatus.ready && cues.isNotEmpty;
@@ -93,33 +105,35 @@ class PlayerState {
     bool? isArabic,
     double? transcribeProgress,
     bool? servedFromCache,
-  }) =>
-      PlayerState(
-        itemId: itemId ?? this.itemId,
-        chapterIndex: chapterIndex ?? this.chapterIndex,
-        totalChapters: totalChapters ?? this.totalChapters,
-        audioReady: audioReady ?? this.audioReady,
-        playing: playing ?? this.playing,
-        finished: finished ?? this.finished,
-        position: position ?? this.position,
-        chapterDuration: chapterDuration ?? this.chapterDuration,
-        chapterStartInBook: chapterStartInBook ?? this.chapterStartInBook,
-        bookDurationSeconds: bookDurationSeconds ?? this.bookDurationSeconds,
-        speed: speed ?? this.speed,
-        vttStatus: vttStatus ?? this.vttStatus,
-        cues: cues ?? this.cues,
-        flatWords: flatWords ?? this.flatWords,
-        currentCueIndex:
-            clearWord ? null : (currentCueIndex ?? this.currentCueIndex),
-        currentWordIndex:
-            clearWord ? null : (currentWordIndex ?? this.currentWordIndex),
-        sleepTimer: sleepTimer ?? this.sleepTimer,
-        readingFontSize: readingFontSize ?? this.readingFontSize,
-        isArabic: isArabic ?? this.isArabic,
-        transcribeProgress:
-            transcribeProgress ?? this.transcribeProgress,
-        servedFromCache: servedFromCache ?? this.servedFromCache,
-      );
+    bool? fullscreenReader,
+  }) => PlayerState(
+    itemId: itemId ?? this.itemId,
+    chapterIndex: chapterIndex ?? this.chapterIndex,
+    totalChapters: totalChapters ?? this.totalChapters,
+    audioReady: audioReady ?? this.audioReady,
+    playing: playing ?? this.playing,
+    finished: finished ?? this.finished,
+    position: position ?? this.position,
+    chapterDuration: chapterDuration ?? this.chapterDuration,
+    chapterStartInBook: chapterStartInBook ?? this.chapterStartInBook,
+    bookDurationSeconds: bookDurationSeconds ?? this.bookDurationSeconds,
+    speed: speed ?? this.speed,
+    vttStatus: vttStatus ?? this.vttStatus,
+    cues: cues ?? this.cues,
+    flatWords: flatWords ?? this.flatWords,
+    currentCueIndex: clearWord
+        ? null
+        : (currentCueIndex ?? this.currentCueIndex),
+    currentWordIndex: clearWord
+        ? null
+        : (currentWordIndex ?? this.currentWordIndex),
+    sleepTimer: sleepTimer ?? this.sleepTimer,
+    readingFontSize: readingFontSize ?? this.readingFontSize,
+    isArabic: isArabic ?? this.isArabic,
+    transcribeProgress: transcribeProgress ?? this.transcribeProgress,
+    servedFromCache: servedFromCache ?? this.servedFromCache,
+    fullscreenReader: fullscreenReader ?? this.fullscreenReader,
+  );
 }
 
 /// Lazily creates and caches the global audio handler.
@@ -132,21 +146,22 @@ final audioHandlerProvider = Provider<AudiobookAudioHandler>((ref) {
 /// Small cached provider for player header info (title/author/cover).
 /// Serves downloaded books instantly from local storage; otherwise fetches
 /// from ABS, returning null when the server is unreachable.
-final bookMetaProvider = FutureProvider.family<AbsItem?, String>(
-  (ref, itemId) async {
-    final offlineBook = ref.watch(offlineStoreProvider).books[itemId];
-    if (offlineBook != null) {
-      return AbsItem.fromJson(
-        jsonDecode(offlineBook.itemJson) as Map<String, dynamic>,
-      );
-    }
-    final abs = ref.read(absClientProvider);
-    try {
-      final res = await abs.get('/api/items/$itemId?expanded=1');
-      if (res.statusCode != 200) return null;
-      return AbsItem.fromJson(res.data as Map<String, dynamic>);
-    } catch (_) {
-      return null;
-    }
-  },
-);
+final bookMetaProvider = FutureProvider.family<AbsItem?, String>((
+  ref,
+  itemId,
+) async {
+  final offlineBook = ref.watch(offlineStoreProvider).books[itemId];
+  if (offlineBook != null) {
+    return AbsItem.fromJson(
+      jsonDecode(offlineBook.itemJson) as Map<String, dynamic>,
+    );
+  }
+  final abs = ref.read(absClientProvider);
+  try {
+    final res = await abs.get('/api/items/$itemId?expanded=1');
+    if (res.statusCode != 200) return null;
+    return AbsItem.fromJson(res.data as Map<String, dynamic>);
+  } catch (_) {
+    return null;
+  }
+});

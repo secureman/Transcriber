@@ -105,12 +105,21 @@ class PlayerController extends Notifier<PlayerState> {
 
     final prefs = ref.read(sharedPrefsProvider);
     final lastSize = prefs.getDouble('reading_font_size') ?? 22;
+    // Carry over the last-used speed both for this session's scrubber math
+    // and so setSpeed() doesn't blast 1.0 over the persisted value when the
+    // user never touches the control.
+    final lastSpeed = prefs.getDouble(kPlaybackSpeedKey) ?? 1.0;
+    // The audio handler is freshly constructed at 1.0 — apply the persisted
+    // speed straight to the underlying player without re-writing the same
+    // value to prefs.
+    unawaited(ref.read(audioHandlerProvider).player.setSpeed(lastSpeed));
 
     state = PlayerState(
       itemId: itemId,
       chapterIndex: chapterIndex,
       vttStatus: VttStatus.loading,
       readingFontSize: lastSize,
+      speed: lastSpeed,
     );
 
     // BUG FIX v1: catch audio errors so VTT still loads.
@@ -546,6 +555,16 @@ class PlayerController extends Notifier<PlayerState> {
   Future<void> setSpeed(double speed) async {
     await ref.read(audioHandlerProvider).setSpeed(speed);
     state = state.copyWith(speed: speed);
+    await ref
+        .read(sharedPrefsProvider)
+        .setDouble(kPlaybackSpeedKey, speed);
+  }
+
+  /// Enters/exits immersive read-along mode. The system-bar transitions and
+  /// layout collapse live in PlayerScreen's build; this just flips the flag.
+  Future<void> setFullscreenReader(bool on) async {
+    if (state.fullscreenReader == on) return;
+    state = state.copyWith(fullscreenReader: on);
   }
 
   Future<void> cycleSpeed() async {

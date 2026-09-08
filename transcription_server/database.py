@@ -358,6 +358,22 @@ async def get_jobs_for_book(book_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def count_incomplete_jobs(book_id: str) -> int:
+    """Number of queued/running jobs for a book (pending or processing).
+
+    Used to decide when the book's audio cache can be deleted: once this
+    returns 0, every chapter has finished and the cache is safe to remove.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM transcription_jobs "
+            "WHERE book_id = ? AND status IN ('pending', 'processing')",
+            (book_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
 async def job_status_counts() -> dict[str, int]:
     """Counts of transcription_jobs rows grouped by status, for a one-line
     startup sanity check — see main.py's lifespan handler.

@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 import time
@@ -11,8 +10,10 @@ from services.vtt_builder import build_vtt
 
 logger = logging.getLogger("job_runner")
 
-# Limits parallel Groq calls (shared with the worker pool in queue.py).
-semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_JOBS)
+# Cached result of the Groq access check (one lightweight models.list() call
+# per process start). Free-plan quota/auth problems then surface as an
+# immediate, clear error on the job row instead of per-chunk retries.
+_groq_access_ok: bool | None = None
 
 
 async def _execute_job(job_id: str) -> None:
@@ -20,7 +21,9 @@ async def _execute_job(job_id: str) -> None:
     captures the full traceback to the log file AND to the DB so the user
     can see what went wrong without having to ssh into the server.
     """
+    global _groq_access_ok
     tmp_dir: str | None = None
+    book_id: str | None = None
     t0 = time.monotonic()
     try:
         job = await db.get_job(job_id)
@@ -28,6 +31,16 @@ async def _execute_job(job_id: str) -> None:
             logger.warning("Job %s vanished before execution", job_id)
             return
         await db.set_job_status(job_id, "processing", progress=0)
+
+        # 0. Validate Groq access before doing any work, so an invalid key
+        #    or a free-plan rate-limit/quota block shows up immediately
+        #    instead of a job hanging at 0%.
+        if not _groq_access_ok:
+            check = await groq_client.check_access()
+            if not check["ok"]:
+                raise RuntimeError(
+                    f"Groq access check failed: {check['detail']}")
+            _groq_access_ok = True
         book_id = job["book_id"]
         chapter_index = job["chapter_index"]
         logger.info(
@@ -59,41 +72,53 @@ async def _execute_job(job_id: str) -> None:
         logger.info("Job %s: chapter spans %d audio file(s)",
                     job_id, len(parts))
 
-        # 3. Extract audio to tmp.
+        # 3. Cache the book's audio locally (once per book), then cut
+        #    Groq-ready chunks (16 kHz mono) from the LOCAL copies.
+        #    ffmpeg's HTTP seek hangs on large single-file books (huge
+        #    `moov` boxes) where a plain HTTP download is fast — so we
+        #    download via httpx and do all seeking locally. Progress 0→15%.
         tmp_dir = os.path.join(settings.TEMP_DIR, f"{book_id}_{chapter_index}")
         os.makedirs(tmp_dir, exist_ok=True)
-        part_paths: list[str] = []
-        for i, (ino, start_in_file, end_in_file) in enumerate(parts):
-            await db.set_job_progress(job_id, 0.02 + 0.10 * i / max(1, len(parts)))
-            url = abs_client.audio_file_url(book_id, ino)
-            part_path = os.path.join(tmp_dir, f"part_{i}.mp3")
-            t = time.monotonic()
-            await ffmpeg_service.extract_chapter(
-                url, settings.ABS_API_TOKEN, start_in_file, end_in_file,
-                part_path)
-            logger.info("Job %s: extracted part %d/%d in %.2fs (%.1fs → %.1fs)",
-                        job_id, i + 1, len(parts), time.monotonic() - t,
-                        start_in_file, end_in_file)
-            part_paths.append(part_path)
-        await db.set_job_progress(job_id, 0.12)
 
-        if len(part_paths) == 1:
-            audio_path = part_paths[0]
-        else:
-            audio_path = os.path.join(tmp_dir, "chapter.mp3")
-            t = time.monotonic()
-            await ffmpeg_service.concat_files(part_paths, audio_path)
-            logger.info("Job %s: concatenated %d parts in %.2fs",
-                        job_id, len(part_paths), time.monotonic() - t)
+        cache_dir = os.path.join(settings.TEMP_DIR, f"{book_id}_cache")
+        files_to_cache = [(ino, abs_client.audio_file_url(book_id, ino))
+                          for ino, _s, _e in parts]
+        t = time.monotonic()
+
+        async def _on_cache(frac: float) -> None:
+            await db.set_job_progress(job_id, 0.08 * frac)
+
+        await ffmpeg_service.ensure_audio_cached(
+            cache_dir, files_to_cache, settings.ABS_API_TOKEN,
+            progress_cb=_on_cache)
+        logger.info("Job %s: audio cache ready in %.2fs (%s)",
+                    job_id, time.monotonic() - t, cache_dir)
+        await db.set_job_progress(job_id, 0.08)
+
+        t = time.monotonic()
+        chunk_duration = (settings.GROQ_CHUNK_SIZE_MB * 1024 * 1024
+                          / (64 * 1024 / 8))
+        local_parts = [
+            (os.path.join(cache_dir, f"audio_{ino}"), s, e)
+            for ino, s, e in parts
+        ]
+        chunks = await ffmpeg_service.prepare_chapter_chunks_local(
+            local_parts, tmp_dir, chunk_duration, overlap_seconds=8.0)
+        logger.info(
+            "Job %s: prepared %d chunk(s) from %d part(s) in %.2fs",
+            job_id, len(chunks), len(parts), time.monotonic() - t)
         await db.set_job_progress(job_id, 0.15)
 
-        # 4. Transcribe (chunked if > 24 MB); progress 15% → 92%.
+        # 4. Transcribe chunks in parallel (bounded by MAX_CONCURRENT_CHUNKS
+        #    within the chapter and MAX_CONCURRENT_GROQ globally).
+        #    Progress 15% → 92%.
         async def _on_progress(fraction: float) -> None:
             await db.set_job_progress(job_id, 0.15 + fraction * 0.77)
 
         t = time.monotonic()
-        words = await groq_client.transcribe_chunked(
-            audio_path, progress_cb=_on_progress)
+        words = await groq_client.transcribe_chunks(
+            chunks, progress_cb=_on_progress,
+            overlap_seconds=8.0, chunk_duration=chunk_duration)
         logger.info("Job %s: groq returned %d words in %.2fs",
                     job_id, len(words), time.monotonic() - t)
 
@@ -125,6 +150,19 @@ async def _execute_job(job_id: str) -> None:
     finally:
         if tmp_dir is not None:
             ffmpeg_service.cleanup_tmp(tmp_dir)
+        # Remove the book's audio cache once NO jobs remain for it. A failed
+        # job keeps the cache (a retry reuses it instead of re-downloading).
+        if book_id is not None:
+            cache_dir = os.path.join(settings.TEMP_DIR, f"{book_id}_cache")
+            if os.path.isdir(cache_dir):
+                try:
+                    remaining = await db.count_incomplete_jobs(book_id)
+                except Exception:  # noqa: BLE001 — cleanup must never crash the job
+                    remaining = 1
+                if remaining == 0:
+                    ffmpeg_service.cleanup_tmp(cache_dir)
+                    logger.info("Job %s: removed audio cache %s "
+                                "(book fully transcribed)", job_id, cache_dir)
 
 
 def _resolve_chapter_parts(audio_files: list[dict], start: float,

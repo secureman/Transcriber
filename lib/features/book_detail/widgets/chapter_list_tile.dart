@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/offline/offline_provider.dart';
@@ -51,6 +52,24 @@ class ChapterListTile extends ConsumerWidget {
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
       onTap: onTap,
+      onLongPress: () {
+        HapticFeedback.mediumImpact();
+        ref
+            .read(readChaptersProvider.notifier)
+            .toggleListened(itemId, index);
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              duration: const Duration(seconds: 2),
+              content: Text(
+                isListened
+                    ? 'Marked "${chapter.title}" as not listened'
+                    : 'Marked "${chapter.title}" as listened',
+              ),
+            ),
+          );
+      },
       title: Text(
         chapter.title,
         maxLines: 1,

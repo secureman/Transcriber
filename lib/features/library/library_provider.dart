@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/network/abs_client.dart';
 import '../../core/offline/offline_provider.dart';
+import '../../core/providers/shared_prefs_provider.dart';
 import '../../models/abs_item.dart';
 
 class LibraryState {
@@ -134,3 +135,29 @@ class LibraryController extends AsyncNotifier<LibraryState> {
 final libraryItemsProvider =
     AsyncNotifierProvider<LibraryController, LibraryState>(
         LibraryController.new);
+
+/// Library layout preference: the ABS-style compact list (default) or the
+/// original covers grid. Persisted so the choice survives restarts.
+enum LibraryViewMode { list, grid }
+
+const _kLibraryViewModeKey = 'library_view_mode';
+
+class LibraryViewModeController extends Notifier<LibraryViewMode> {
+  @override
+  LibraryViewMode build() {
+    final stored =
+        ref.watch(sharedPrefsProvider).getString(_kLibraryViewModeKey);
+    return stored == 'grid' ? LibraryViewMode.grid : LibraryViewMode.list;
+  }
+
+  Future<void> set(LibraryViewMode mode) async {
+    state = mode;
+    await ref
+        .read(sharedPrefsProvider)
+        .setString(_kLibraryViewModeKey, mode.name);
+  }
+}
+
+final libraryViewModeProvider =
+    NotifierProvider<LibraryViewModeController, LibraryViewMode>(
+        LibraryViewModeController.new);

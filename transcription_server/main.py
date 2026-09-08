@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import database as db
 from config import settings
 from routers import metadata, transcribe, vtt
-from services import ffmpeg_service, queue as job_queue
+from services import ffmpeg_service, groq_client, queue as job_queue
 from services.ffmpeg_service import ensure_dirs
 
 
@@ -127,6 +127,16 @@ app.include_router(metadata.router, prefix="/api")
 @app.get("/api/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/api/check/groq")
+async def check_groq() -> dict:
+    """Validates the Groq API key without consuming transcription quota.
+
+    Free-plan users can confirm they aren't rate-limited / out of quota
+    before starting a transcription, instead of only finding out mid-job.
+    """
+    return await groq_client.check_access()
 
 
 if __name__ == "__main__":

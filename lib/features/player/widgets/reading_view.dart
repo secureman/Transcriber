@@ -1,6 +1,7 @@
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import '../../../core/providers/config_provider.dart';
 import '../../../core/providers/reader_theme_provider.dart';
@@ -17,8 +18,17 @@ class ReadingView extends ConsumerStatefulWidget {
 }
 
 class _ReadingViewState extends ConsumerState<ReadingView> {
-  final _scrollController = ScrollController();
-  final _cueKeys = <int, GlobalKey>{};
+  // scrollable_positioned_list instead of a plain ScrollController +
+  // GlobalKey/ensureVisible: the old approach could only scroll to a cue
+  // whose widget was still mounted (i.e. within the viewport + cache
+  // extent). Scroll far enough away — in either direction — and the
+  // target cue's Element gets discarded, so `_cueKeys[ci]?.currentContext`
+  // came back null and the resync button silently did nothing. This
+  // controller tracks index positions independently of what's currently
+  // built, so `scrollTo`/`jumpTo` work reliably no matter how far away
+  // the current scroll position is.
+  final _itemScrollController = ItemScrollController();
+  final _itemPositionsListener = ItemPositionsListener.create();
   int? _lastScrolledCue;
   // True once the user has manually dragged the list away from wherever
   // auto-follow last put it. While true, auto-follow is suspended (so the
@@ -28,30 +38,17 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
   // something this app actually needs since it has no AI chat feature.
   bool _autoFollowSuspended = false;
 
-  @override
-  void dispose() {
-    _scrollController.dispose();
-    super.dispose();
-  }
-
-  GlobalKey _keyFor(int ci) =>
-      _cueKeys[ci] ??= GlobalKey(debugLabel: 'cue$ci');
-
   void _scrollToCue(int ci, {bool force = false}) {
     if (_autoFollowSuspended && !force) return;
     if (ci == _lastScrolledCue && !force) return;
     _lastScrolledCue = ci;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final ctx = _cueKeys[ci]?.currentContext;
-      if (ctx != null && mounted) {
-        Scrollable.ensureVisible(
-          ctx,
-          alignment: 0.3,
-          duration: const Duration(milliseconds: 350),
-          curve: Curves.easeOutCubic,
-        );
-      }
-    });
+    if (!_itemScrollController.isAttached) return;
+    _itemScrollController.scrollTo(
+      index: ci,
+      alignment: 0.3,
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   void _resync(int? cueIndex) {
@@ -102,8 +99,8 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
                   child: NotificationListener<ScrollNotification>(
                     onNotification: (n) {
                       // Only a real user drag suspends auto-follow — the
-                      // programmatic ensureVisible() scroll from
-                      // _scrollToCue must not trip this back on itself.
+                      // programmatic scrollTo() from _scrollToCue must not
+                      // trip this back on itself.
                       if (n is ScrollStartNotification &&
                           n.dragDetails != null &&
                           !_autoFollowSuspended) {
@@ -111,27 +108,30 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
                       }
                       return false;
                     },
-                    child: ListView(
-                      controller: _scrollController,
+                    child: ScrollablePositionedList.builder(
+                      itemScrollController: _itemScrollController,
+                      itemPositionsListener: _itemPositionsListener,
                       physics: const BouncingScrollPhysics(),
                       padding: const EdgeInsets.symmetric(
                           horizontal: 22, vertical: 28),
-                      children: [
-                        for (var ci = 0; ci < player.cues.length; ci++)
-                          _CueParagraph(
-                            key: _keyFor(ci),
-                            cue: player.cues[ci],
-                            cueIndex: ci,
-                            activeCueIndex: cueIndex,
-                            activeWordIndex:
-                                cueIndex == ci ? player.currentWordIndex : null,
-                            fontSize: player.readingFontSize,
-                            isArabic: player.isArabic,
-                            theme: theme,
-                            onWordTap: onWordTap,
-                          ),
-                        const SizedBox(height: 40),
-                      ],
+                      itemCount: player.cues.length + 1,
+                      itemBuilder: (context, i) {
+                        if (i == player.cues.length) {
+                          return const SizedBox(height: 40);
+                        }
+                        return _CueParagraph(
+                          key: ValueKey(i),
+                          cue: player.cues[i],
+                          cueIndex: i,
+                          activeCueIndex: cueIndex,
+                          activeWordIndex:
+                              cueIndex == i ? player.currentWordIndex : null,
+                          fontSize: player.readingFontSize,
+                          isArabic: player.isArabic,
+                          theme: theme,
+                          onWordTap: onWordTap,
+                        );
+                      },
                     ),
                   ),
                 ),

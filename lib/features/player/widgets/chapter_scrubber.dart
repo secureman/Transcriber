@@ -7,6 +7,7 @@ import '../player_provider.dart';
 import '../player_state.dart';
 import 'chapter_sheet.dart';
 
+
 /// Chapter-name pill + scrubber + three-label time row (ElevenReader style):
 /// elapsed-in-book on the left, time-left-in-book in the center, time-left
 /// in the current chapter on the right.
@@ -29,16 +30,23 @@ class ChapterScrubber extends ConsumerWidget {
     final elapsedInBook =
         (player.chapterStartInBook + player.position.inMilliseconds / 1000.0)
             .asDuration;
-    final leftInBook = (player.bookDurationSeconds -
-            player.chapterStartInBook -
-            player.position.inMilliseconds / 1000.0)
-        .clamp(0, double.infinity)
-        .toDouble()
-        .asDuration;
-    final leftInChapter =
-        (player.chapterDuration - player.position).isNegative
-            ? Duration.zero
-            : player.chapterDuration - player.position;
+    // Time-remaining labels are speed-adjusted (ABS-style): 10 minutes of
+    // audio at 2× means 5 minutes of listening left.
+    final speed = player.speed;
+    final leftInBook = atPlaybackSpeed(
+      (player.bookDurationSeconds -
+              player.chapterStartInBook -
+              player.position.inMilliseconds / 1000.0)
+          .clamp(0, double.infinity)
+          .toDouble()
+          .asDuration,
+      speed,
+    );
+    final leftInChapterRaw = player.chapterDuration - player.position;
+    final leftInChapter = atPlaybackSpeed(
+      leftInChapterRaw.isNegative ? Duration.zero : leftInChapterRaw,
+      speed,
+    );
 
     final chapterTitle = (meta != null &&
             player.chapterIndex >= 0 &&

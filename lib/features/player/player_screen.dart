@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -48,88 +49,125 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   Widget build(BuildContext context) {
     final config = ref.watch(configProvider);
     final player = ref.watch(playerProvider);
+    final fullscreen = player.fullscreenReader;
 
-    return Scaffold(
-      backgroundColor: AppColors.background,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          // 1. Blurred cover background at low opacity.
-          _BackgroundCover(itemId: widget.itemId, config: config),
-          // 2. Dark gradient overlay.
-          DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  Colors.black.withValues(alpha: 0.85),
-                  Colors.black,
+    // Keep the system bars in sync with immersive mode. The select() makes
+    // the listener fire only when the flag itself flips, not on every
+    // playback position tick.
+    ref.listen(playerProvider.select((s) => s.fullscreenReader), (_, on) {
+      SystemChrome.setEnabledSystemUIMode(
+        on ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+      );
+    });
+
+    // Android back gesture/button: in fullscreen, back first leaves
+    // fullscreen instead of popping the whole player.
+    return PopScope(
+      canPop: !fullscreen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && fullscreen) {
+          ref.read(playerProvider.notifier).setFullscreenReader(false);
+        }
+      },
+      child: Scaffold(
+        backgroundColor: AppColors.background,
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            // 1. Blurred cover background at low opacity.
+            _BackgroundCover(itemId: widget.itemId, config: config),
+            // 2. Dark gradient overlay.
+            DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Colors.black.withValues(alpha: 0.85), Colors.black],
+                ),
+              ),
+            ),
+            // 3. Foreground content.
+            SafeArea(
+              top: !fullscreen,
+              child: Column(
+                children: [
+                  _AppBar(itemId: widget.itemId, fullscreen: fullscreen),
+                  Expanded(child: _ReaderContainer(fullscreen: fullscreen)),
+                  if (!fullscreen && player.finished)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 8,
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(
+                            Icons.check_circle,
+                            color: AppColors.success,
+                            size: 18,
+                          ),
+                          const SizedBox(width: 8),
+                          const Text(
+                            'End of book',
+                            style: TextStyle(
+                              color: AppColors.textPrimary,
+                              fontSize: 13,
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+                          FilledButton.tonal(
+                            onPressed: () =>
+                                ref.read(playerProvider.notifier).restart(),
+                            child: const Text('Restart'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  if (!fullscreen) ...[
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 16),
+                      child: ChapterScrubber(),
+                    ),
+                    const SizedBox(height: 10),
+                    const AudioControls(),
+                    const SizedBox(height: 8),
+                    const PlayerAccessoryRow(),
+                    const SizedBox(height: 12),
+                  ],
                 ],
               ),
             ),
-          ),
-          // 3. Foreground content.
-          SafeArea(
-            child: Column(
-              children: [
-                _AppBar(itemId: widget.itemId),
-                Expanded(
-                  child: Consumer(
-                    builder: (_, ref, _) {
-                      final t = ReaderThemeData.all[
-                          ref.watch(readerThemeProvider)]!;
-                      return Container(
-                        margin: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-                        clipBehavior: Clip.antiAlias,
-                        decoration: BoxDecoration(
-                          color: t.background,
-                          borderRadius:
-                              BorderRadius.circular(AppColors.cardRadius),
-                        ),
-                        child: const ReadingView(),
-                      );
-                    },
-                  ),
-                ),
-                if (player.finished)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 24, vertical: 8),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const Icon(Icons.check_circle,
-                            color: AppColors.success, size: 18),
-                        const SizedBox(width: 8),
-                        const Text(
-                          'End of book',
-                          style: TextStyle(
-                              color: AppColors.textPrimary, fontSize: 13),
-                        ),
-                        const SizedBox(width: 16),
-                        FilledButton.tonal(
-                          onPressed: () =>
-                              ref.read(playerProvider.notifier).restart(),
-                          child: const Text('Restart'),
-                        ),
-                      ],
-                    ),
-                  ),
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 16),
-                  child: ChapterScrubber(),
-                ),
-                const SizedBox(height: 10),
-                const AudioControls(),
-                const SizedBox(height: 8),
-                const PlayerAccessoryRow(),
-                const SizedBox(height: 12),
-              ],
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
+    );
+  }
+}
+
+/// The reading-area container. Normal mode: an inset rounded card tinted
+/// with the reader theme's background. Fullscreen: edge-to-edge with no
+/// rounding or margins, so the transcript owns the whole screen.
+class _ReaderContainer extends ConsumerWidget {
+  final bool fullscreen;
+
+  const _ReaderContainer({required this.fullscreen});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = ReaderThemeData.all[ref.watch(readerThemeProvider)]!;
+    return Container(
+      margin: fullscreen
+          ? EdgeInsets.zero
+          : const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: t.background,
+        borderRadius: fullscreen
+            ? BorderRadius.zero
+            : BorderRadius.circular(AppColors.cardRadius),
+      ),
+      child: const ReadingView(),
     );
   }
 }
@@ -169,8 +207,9 @@ class _BackgroundCover extends ConsumerWidget {
 
 class _AppBar extends ConsumerWidget {
   final String itemId;
+  final bool fullscreen;
 
-  const _AppBar({required this.itemId});
+  const _AppBar({required this.itemId, required this.fullscreen});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -213,6 +252,20 @@ class _AppBar extends ConsumerWidget {
               ],
             ),
           ),
+          // Immersive read-along toggle: expands the transcript over the
+          // whole screen (hides the scrubber/controls and the system bars).
+          // Tap again — or press Android back — to restore.
+          IconButton(
+            icon: Icon(
+              fullscreen
+                  ? Icons.fullscreen_exit_rounded
+                  : Icons.fullscreen_rounded,
+            ),
+            tooltip: fullscreen ? 'Exit fullscreen' : 'Fullscreen read-along',
+            onPressed: () => ref
+                .read(playerProvider.notifier)
+                .setFullscreenReader(!fullscreen),
+          ),
           // Direct-access theme cycle button (long-press → open sheet).
           // Single tap cycles through themes so users don't have to
           // open the overflow menu just to change the look.
@@ -230,8 +283,7 @@ class _AppBar extends ConsumerWidget {
   void _showOverflowMenu(BuildContext context, WidgetRef ref) {
     final player = ref.watch(playerProvider);
     final notifier = ref.read(playerProvider.notifier);
-    final selectedTheme =
-        ref.watch(readerThemeProvider);
+    final selectedTheme = ref.watch(readerThemeProvider);
 
     showModalBottomSheet<void>(
       context: context,
@@ -252,35 +304,45 @@ class _AppBar extends ConsumerWidget {
                   color: ReaderThemeData.all[selectedTheme]!.swatch,
                   shape: BoxShape.circle,
                   border: Border.all(
-                    color: AppColors.surfaceElevated, width: 1),
+                    color: AppColors.surfaceElevated,
+                    width: 1,
+                  ),
                 ),
                 alignment: Alignment.center,
                 child: Container(
-                  width: 12, height: 12,
+                  width: 12,
+                  height: 12,
                   decoration: BoxDecoration(
                     color: ReaderThemeData.all[selectedTheme]!.highlightBg,
                     shape: BoxShape.circle,
                   ),
                 ),
               ),
-              title: const Text('Reader theme',
-                  style: TextStyle(
-                      color: AppColors.textPrimary, fontSize: 14)),
+              title: const Text(
+                'Reader theme',
+                style: TextStyle(color: AppColors.textPrimary, fontSize: 14),
+              ),
               subtitle: Text(
                 ReaderThemeData.all[selectedTheme]!.name,
                 style: const TextStyle(
-                    color: AppColors.textSecondary, fontSize: 12),
+                  color: AppColors.textSecondary,
+                  fontSize: 12,
+                ),
               ),
-              trailing: const Icon(Icons.chevron_right,
-                  color: AppColors.textSecondary, size: 20),
+              trailing: const Icon(
+                Icons.chevron_right,
+                color: AppColors.textSecondary,
+                size: 20,
+              ),
               onTap: () {
                 Navigator.of(context).pop();
                 showModalBottomSheet<void>(
                   context: context,
                   backgroundColor: AppColors.surface,
                   shape: const RoundedRectangleBorder(
-                    borderRadius:
-                        BorderRadius.vertical(top: Radius.circular(20)),
+                    borderRadius: BorderRadius.vertical(
+                      top: Radius.circular(20),
+                    ),
                   ),
                   builder: (_) => const ThemeSheet(),
                 );
@@ -290,11 +352,14 @@ class _AppBar extends ConsumerWidget {
             // ── Sleep timer (shared sheet — see sleep_timer_sheet.dart;
             // also reachable directly from the moon icon in AudioControls)
             ListTile(
-              leading: const Icon(Icons.bedtime_outlined,
-                  color: AppColors.textPrimary),
-              title: const Text('Sleep timer',
-                  style:
-                      TextStyle(color: AppColors.textPrimary, fontSize: 14)),
+              leading: const Icon(
+                Icons.bedtime_outlined,
+                color: AppColors.textPrimary,
+              ),
+              title: const Text(
+                'Sleep timer',
+                style: TextStyle(color: AppColors.textPrimary, fontSize: 14),
+              ),
               subtitle: player.sleepTimer != SleepTimerState.off
                   ? Text(
                       switch (player.sleepTimer) {
@@ -304,11 +369,16 @@ class _AppBar extends ConsumerWidget {
                         SleepTimerState.off => '',
                       },
                       style: const TextStyle(
-                          color: AppColors.textSecondary, fontSize: 12),
+                        color: AppColors.textSecondary,
+                        fontSize: 12,
+                      ),
                     )
                   : null,
-              trailing: const Icon(Icons.chevron_right,
-                  color: AppColors.textSecondary, size: 20),
+              trailing: const Icon(
+                Icons.chevron_right,
+                color: AppColors.textSecondary,
+                size: 20,
+              ),
               onTap: () {
                 Navigator.of(context).pop();
                 showSleepTimerSheet(context);
@@ -323,9 +393,10 @@ class _AppBar extends ConsumerWidget {
                 child: Text(
                   'Font size',
                   style: TextStyle(
-                      color: AppColors.textPrimary,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 15),
+                    color: AppColors.textPrimary,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 15,
+                  ),
                 ),
               ),
             ),
@@ -377,8 +448,7 @@ class _QuickThemeButton extends ConsumerWidget {
             context: context,
             backgroundColor: AppColors.surface,
             shape: const RoundedRectangleBorder(
-              borderRadius:
-                  BorderRadius.vertical(top: Radius.circular(20)),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
             ),
             builder: (_) => const ThemeSheet(),
           );
@@ -386,7 +456,8 @@ class _QuickThemeButton extends ConsumerWidget {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
           child: Container(
-            width: 24, height: 24,
+            width: 24,
+            height: 24,
             decoration: BoxDecoration(
               color: data.swatch,
               shape: BoxShape.circle,
@@ -397,7 +468,8 @@ class _QuickThemeButton extends ConsumerWidget {
             ),
             alignment: Alignment.center,
             child: Container(
-              width: 10, height: 10,
+              width: 10,
+              height: 10,
               decoration: BoxDecoration(
                 color: data.highlightBg,
                 shape: BoxShape.circle,
@@ -409,4 +481,3 @@ class _QuickThemeButton extends ConsumerWidget {
     );
   }
 }
-

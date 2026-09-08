@@ -20,6 +20,15 @@ extension DurationFormat on Duration {
   }
 }
 
+/// Audiobookshelf-style time-remaining adjustment: audio time remaining
+/// divided by the playback speed (10 minutes of audio at 2× = 5 minutes
+/// of listening left). Falls back to the unadjusted [remaining] when
+/// [speed] isn't usable (0, negative, or absurdly small).
+Duration atPlaybackSpeed(Duration remaining, double speed) {
+  if (speed <= 0.05) return remaining;
+  return Duration(milliseconds: (remaining.inMilliseconds / speed).round());
+}
+
 extension DoubleSeconds on double {
   Duration get asDuration => Duration(milliseconds: (this * 1000).round());
 }

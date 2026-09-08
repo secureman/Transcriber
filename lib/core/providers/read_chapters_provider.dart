@@ -30,10 +30,55 @@ class ReadChaptersController extends Notifier<Set<String>> {
     if (state.contains(k)) return;
     final next = {...state, k};
     state = next;
-    await ref
-        .read(sharedPrefsProvider)
-        .setStringList(kReadChaptersKey, next.toList());
+    await _persist(next);
   }
+
+  /// Un-marks a chapter as listened. No-op if it wasn't marked.
+  Future<void> unmarkListened(String itemId, int chapterIndex) async {
+    final k = _key(itemId, chapterIndex);
+    if (!state.contains(k)) return;
+    final next = {...state}..remove(k);
+    state = next;
+    await _persist(next);
+  }
+
+  /// Flips a single chapter's listened flag. Used by long-press.
+  Future<void> toggleListened(String itemId, int chapterIndex) =>
+      isListened(itemId, chapterIndex)
+          ? unmarkListened(itemId, chapterIndex)
+          : markListened(itemId, chapterIndex);
+
+  /// True only when every chapter 0..chapterCount-1 of [itemId] is marked.
+  bool isBookListened(String itemId, int chapterCount) {
+    if (chapterCount <= 0) return false;
+    for (var i = 0; i < chapterCount; i++) {
+      if (!state.contains(_key(itemId, i))) return false;
+    }
+    return true;
+  }
+
+  /// Marks every chapter of the book as listened (long-press on the book
+  /// cover). If it's already fully listened, un-marks all of them instead —
+  /// same toggle affordance as a single chapter.
+  Future<void> toggleBookListened(String itemId, int chapterCount) async {
+    if (chapterCount <= 0) return;
+    final makeListened = !isBookListened(itemId, chapterCount);
+    final next = {...state};
+    for (var i = 0; i < chapterCount; i++) {
+      final k = _key(itemId, i);
+      if (makeListened) {
+        next.add(k);
+      } else {
+        next.remove(k);
+      }
+    }
+    state = next;
+    await _persist(next);
+  }
+
+  Future<void> _persist(Set<String> next) => ref
+      .read(sharedPrefsProvider)
+      .setStringList(kReadChaptersKey, next.toList());
 
   /// Wipes the listened history.
   Future<void> clear() async {
