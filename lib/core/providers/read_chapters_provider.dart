@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../models/abs_item.dart';
 import 'shared_prefs_provider.dart';
 
 /// Tracks which (item, chapter) pairs the user has finished listening to.
@@ -45,8 +46,8 @@ class ReadChaptersController extends Notifier<Set<String>> {
   /// Flips a single chapter's listened flag. Used by long-press.
   Future<void> toggleListened(String itemId, int chapterIndex) =>
       isListened(itemId, chapterIndex)
-          ? unmarkListened(itemId, chapterIndex)
-          : markListened(itemId, chapterIndex);
+      ? unmarkListened(itemId, chapterIndex)
+      : markListened(itemId, chapterIndex);
 
   /// True only when every chapter 0..chapterCount-1 of [itemId] is marked.
   bool isBookListened(String itemId, int chapterCount) {
@@ -85,8 +86,47 @@ class ReadChaptersController extends Notifier<Set<String>> {
     state = const <String>{};
     await ref.read(sharedPrefsProvider).remove(kReadChaptersKey);
   }
+
+  /// Rebuilds the listened set for [itemId] from the server's resume position,
+  /// but only when this book has NO local listened entries yet (i.e. a fresh
+  /// install where the local set was wiped). This is a best-effort heuristic:
+  /// marks every chapter whose end falls at or before [resumeSeconds] (plus a
+  /// small tolerance) as listened, so the in-app badges match the server state.
+  ///
+  /// Is a no-op when the local set already has entries for [itemId] (don't
+  /// clobber in-session toggles or progress from another device that landed
+  /// between the wipe and this call).
+  Future<void> restoreFromServerProgress(
+    String itemId,
+    double resumeSeconds,
+    List<AbsChapter> chapters,
+  ) async {
+    if (resumeSeconds <= 0 || chapters.isEmpty) return;
+    // Bail out if the user already has local progress for this book — don't
+    // overwrite in-session work or progress that landed on the server between
+    // the wipe and this call.
+    if (state.any((k) => k.startsWith('$itemId/'))) {
+      return;
+    }
+
+    final tolerance = 15.0; // seconds — forgive small stale-ABS drift
+    final threshold = resumeSeconds + tolerance;
+    final toAdd = <String>{};
+    for (var i = 0; i < chapters.length; i++) {
+      final ch = chapters[i];
+      if (ch.end <= threshold) {
+        toAdd.add(_key(itemId, i));
+      }
+    }
+    if (toAdd.isEmpty) return;
+
+    final next = {...state, ...toAdd};
+    state = next;
+    await _persist(next);
+  }
 }
 
 final readChaptersProvider =
     NotifierProvider<ReadChaptersController, Set<String>>(
-        ReadChaptersController.new);
+      ReadChaptersController.new,
+    );

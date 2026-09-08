@@ -4,9 +4,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../../models/abs_item.dart';
 import '../providers/config_provider.dart';
-import '../providers/shared_prefs_provider.dart';
 import 'abs_client.dart';
 
 /// SharedPreferences key holding this install's stable device id.
@@ -18,7 +16,8 @@ Future<String> getOrCreateDeviceId(SharedPreferences prefs) async {
   var id = prefs.getString(_deviceIdKey);
   if (id == null || id.isEmpty) {
     final r = Random();
-    id = '${DateTime.now().millisecondsSinceEpoch}'
+    id =
+        '${DateTime.now().millisecondsSinceEpoch}'
         '-${r.nextInt(0xFFFFFF).toRadixString(16).padLeft(6, '0')}'
         '-${r.nextInt(0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
     await prefs.setString(_deviceIdKey, id);
@@ -41,11 +40,11 @@ class AbsUserInfo {
   });
 
   factory AbsUserInfo.fromJson(Map<String, dynamic> json) => AbsUserInfo(
-        id: (json['id'] as String?) ?? '',
-        username: (json['username'] as String?) ?? '',
-        name: (json['name'] as String?) ?? '',
-        avatar: json['avatar'] as String?,
-      );
+    id: (json['id'] as String?) ?? '',
+    username: (json['username'] as String?) ?? '',
+    name: (json['name'] as String?) ?? '',
+    avatar: json['avatar'] as String?,
+  );
 
   String get displayName => name.isNotEmpty ? name : username;
 }
@@ -65,145 +64,69 @@ final currentUserProvider = FutureProvider<AbsUserInfo?>((ref) async {
   }
 });
 
-/// Pushes playback progress to Audiobookshelf (POST /api/sync/local-media-
-/// progress) so it stays consistent across the web player, other clients and
-/// the ABS admin UI.
+/// Pushes playback progress to Audiobookshelf via the MediaProgress upsert
+/// endpoint, `PATCH /api/me/progress/:libraryItemId`, which has existed on
+/// every ABS v2.4+ release (and still exists on master). The handler spreads
+/// the request body straight onto the user's media-progress record, so we
+/// send the media-progress fields directly — NOT wrapped in a `progress`
+/// key, and without the old `/api/sync/local-media-progress` sync payload
+/// (deviceId/journalMode/audioTracks/libraryItem) that the modern server
+/// doesn't expect.
 class AbsProgressSyncer {
   AbsProgressSyncer(this.ref);
 
   final Ref ref;
-  String? _deviceId;
-  bool _disabled = false;
 
-  Future<String> _device() async {
-    var id = _deviceId;
-    if (id == null) {
-      id = await getOrCreateDeviceId(ref.read(sharedPrefsProvider));
-      _deviceId = id;
-    }
-    return id;
-  }
-
-  /// Reports a position for [itemId]. Returns true when the server accepted
-  /// it. After certain errors the syncer disables itself to avoid hammering
-  /// an incompatible/older ABS server every few seconds.
   Future<bool> reportProgress({
     required String itemId,
-    required String mediaId,
     required double durationSec,
     required double currentTimeSec,
     bool isFinished = false,
     int? startedAt,
     int? finishedAt,
-    List<Map<String, dynamic>> audioTracks = const [],
-    Map<String, dynamic>? libraryItem,
   }) async {
-    if (_disabled) return false;
     final config = ref.read(configProvider);
-    if (!config.isConfigured || itemId.isEmpty || mediaId.isEmpty) return false;
+    if (!config.isConfigured || itemId.isEmpty) return false;
     if (durationSec <= 0) return false;
 
-    final deviceId = await _device();
     final body = <String, dynamic>{
-      'itemId': itemId,
-      'deviceId': deviceId,
-      'progress': {
-        'id': 'local-$deviceId-$itemId',
-        'deviceId': deviceId,
-        'libraryItemId': itemId,
-        'mediaId': mediaId,
-        'isFinished': isFinished,
-        'duration': durationSec.round(),
-        'currentTime': currentTimeSec <= 0 ? 0 : currentTimeSec,
-        'startedAt': startedAt,
-        'finishedAt': finishedAt,
-        'journalMode': 'sync',
-        'audioTracks': audioTracks,
-        'libraryItem': libraryItem,
-        'episode': null,
-      },
+      'isFinished': isFinished,
+      'duration': durationSec.round(),
+      'currentTime': currentTimeSec <= 0 ? 0 : currentTimeSec,
+      'startedAt': startedAt,
+      'finishedAt': finishedAt,
     };
 
     try {
       final abs = ref.read(absClientProvider);
-      final res = await abs.post('/api/sync/local-media-progress', data: body);
-      return res.statusCode != null && res.statusCode! < 300;
+      final res = await abs.patch('/api/me/progress/$itemId', data: body);
+      if (res.statusCode == null || res.statusCode! >= 300) {
+        final status = res.statusCode;
+        // 4xx responses don't throw under this Dio config (validateStatus
+        // < 500), so handle them here. These are permanent contract errors —
+        // don't retry forever against an ABS that doesn't support them.
+        if (status == 400 || status == 404 || status == 405 || status == 422) {
+          return _unsupported();
+        }
+        return false;
+      }
+      return true;
     } catch (e) {
+      // Network-level failure (timeout, connection refused) — callers decide
+      // whether to back off and retry.
       final status = (e is DioException) ? e.response?.statusCode : null;
-      // Endpoint/payload not supported on this ABS version — stop retrying
-      // every few seconds for the rest of this session.
       if (status == 400 || status == 404 || status == 405 || status == 422) {
-        _disabled = true;
+        return _unsupported();
       }
       return false;
     }
   }
+
+  /// A permanent contract error — the caller treats this the same as a
+  /// non-2xx so it can stop hammering an incompatible ABS.
+  bool _unsupported() => false;
 }
 
-final progressSyncProvider =
-    Provider<AbsProgressSyncer>((ref) => AbsProgressSyncer(ref));
-
-/// Minified `libraryItem` payload ABS expects inside the sync body.
-Map<String, dynamic> buildMinifiedLibraryItem(AbsItem item) => {
-      'id': item.id,
-      'media': {
-        'id': item.mediaId,
-        'metadata': {
-          'title': item.title,
-          'authorName': item.author,
-        },
-        'duration': item.duration,
-        'numAudioFiles': item.audioFiles.length,
-        'numChapters': item.chapters.length,
-        'chapters': [
-          for (final c in item.chapters)
-            {
-              'id': c.id,
-              'start': c.start,
-              'end': c.end,
-              'title': c.title,
-            },
-        ],
-        'hasEmbeddedCover': item.coverPath.isNotEmpty,
-      },
-    };
-
-/// One `audioTracks` entry for the sync body.
-Map<String, dynamic> buildAudioTrack({
-  required int index,
-  required String filename,
-  required String url,
-}) =>
-    {
-      'index': index,
-      'title': filename,
-      'contentUrl': url,
-      'mimeType': _mimeFor(filename),
-    };
-
-String _mimeFor(String filename) {
-  final ext = filename.contains('.')
-      ? filename.split('.').last.toLowerCase()
-      : '';
-  switch (ext) {
-    case 'mp3':
-      return 'audio/mpeg';
-    case 'm4b':
-    case 'm4a':
-    case 'aac':
-    case 'mp4':
-      return 'audio/mp4';
-    case 'flac':
-      return 'audio/flac';
-    case 'ogg':
-      return 'audio/ogg';
-    case 'opus':
-      return 'audio/opus';
-    case 'wav':
-      return 'audio/wav';
-    case 'webm':
-      return 'audio/webm';
-    default:
-      return 'audio/mpeg';
-  }
-}
+final progressSyncProvider = Provider<AbsProgressSyncer>(
+  (ref) => AbsProgressSyncer(ref),
+);

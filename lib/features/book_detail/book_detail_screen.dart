@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
+import '../../core/providers/read_chapters_provider.dart';
 import '../../core/providers/shared_prefs_provider.dart';
 import '../../core/theme/app_theme.dart';
 import '../../core/utils/duration_ext.dart';
@@ -32,16 +35,39 @@ class BookDetailScreen extends ConsumerWidget {
             child: CircularProgressIndicator(color: AppColors.primary),
           ),
           error: (e, _) => Center(
-            child: Text('Failed to load book\n$e',
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: AppColors.textSecondary)),
+            child: Text(
+              'Failed to load book\n$e',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppColors.textSecondary),
+            ),
           ),
           data: (book) {
             final config = ref.watch(configProvider);
             final prefs = ref.watch(sharedPrefsProvider);
-            final lastPlayed = book.resumePosition()?.chapterIndex ??
+            final lastPlayed =
+                book.resumePosition()?.chapterIndex ??
                 AppConfig.lastPlayedChapter(prefs, itemId) ??
                 0;
+            // After a fresh install / app reinstall, the local listened-chapter
+            // set is empty (it was wiped in SharedPreferences). When the server
+            // reports a resume position, rebuild the listened badges from it —
+            // best-effort: marks every chapter whose end falls at or before the
+            // resume point (plus a small tolerance for stale-ABS drift) as
+            // listened. No-op if the user already has local progress for this
+            // book (in-session work, or progress that landed on the server between
+            // the wipe and this call).
+            final resumeSec = book.resumeSeconds;
+            if (resumeSec != null && resumeSec > 0) {
+              unawaited(
+                ref
+                    .read(readChaptersProvider.notifier)
+                    .restoreFromServerProgress(
+                      itemId,
+                      resumeSec,
+                      book.chapters,
+                    ),
+              );
+            }
             final statuses = jobsAsync.valueOrNull ?? const {};
             final active = activeJobsAsync.valueOrNull ?? const [];
 
@@ -94,7 +120,8 @@ class BookDetailScreen extends ConsumerWidget {
                   ),
                   const SizedBox(height: 24),
                   FilledButton.icon(
-                    onPressed: () => context.push('/player/$itemId/$lastPlayed'),
+                    onPressed: () =>
+                        context.push('/player/$itemId/$lastPlayed'),
                     style: FilledButton.styleFrom(
                       minimumSize: const Size.fromHeight(50),
                     ),
@@ -152,8 +179,9 @@ class BookDetailScreen extends ConsumerWidget {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-              'Transcription requires a transcription server. '
-              'Add its URL in Setup to enable this feature.'),
+            'Transcription requires a transcription server. '
+            'Add its URL in Setup to enable this feature.',
+          ),
         ),
       );
       return;
@@ -179,7 +207,6 @@ class BookDetailScreen extends ConsumerWidget {
     });
   }
 }
-
 
 class _Header extends StatelessWidget {
   final AbsItem book;
@@ -275,14 +302,18 @@ class _ActiveJobsBanner extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 8),
-          ...shown.map((j) => _ActiveJobRow(job: j, isOwn: j.bookId == thisBookId)),
+          ...shown.map(
+            (j) => _ActiveJobRow(job: j, isOwn: j.bookId == thisBookId),
+          ),
           if (overflow > 0)
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Text(
                 '+ $overflow more',
                 style: const TextStyle(
-                    color: AppColors.textSecondary, fontSize: 11),
+                  color: AppColors.textSecondary,
+                  fontSize: 11,
+                ),
               ),
             ),
         ],
@@ -321,7 +352,9 @@ class _ActiveJobRow extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    color: isOwn ? AppColors.textPrimary : AppColors.textSecondary,
+                    color: isOwn
+                        ? AppColors.textPrimary
+                        : AppColors.textSecondary,
                     fontSize: 12,
                     fontWeight: isOwn ? FontWeight.w600 : FontWeight.w400,
                   ),
@@ -330,7 +363,9 @@ class _ActiveJobRow extends StatelessWidget {
               Text(
                 '${job.progress.round()}% · ${_durationLabel()}',
                 style: const TextStyle(
-                    color: AppColors.textSecondary, fontSize: 11),
+                  color: AppColors.textSecondary,
+                  fontSize: 11,
+                ),
               ),
             ],
           ),
@@ -341,8 +376,7 @@ class _ActiveJobRow extends StatelessWidget {
               value: (job.progress / 100).clamp(0.0, 1.0),
               minHeight: 3,
               backgroundColor: AppColors.surface,
-              valueColor:
-                  const AlwaysStoppedAnimation(AppColors.primary),
+              valueColor: const AlwaysStoppedAnimation(AppColors.primary),
             ),
           ),
         ],
@@ -350,7 +384,6 @@ class _ActiveJobRow extends StatelessWidget {
     );
   }
 }
-
 
 class _Cover extends ConsumerWidget {
   final AbsItem book;
@@ -369,7 +402,10 @@ class _Cover extends ConsumerWidget {
         borderRadius: BorderRadius.circular(AppColors.cardRadius),
         boxShadow: const [
           BoxShadow(
-              color: Colors.black54, blurRadius: 12, offset: Offset(0, 6)),
+            color: Colors.black54,
+            blurRadius: 12,
+            offset: Offset(0, 6),
+          ),
         ],
       ),
       child: CoverImage(

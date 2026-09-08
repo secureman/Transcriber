@@ -10,6 +10,7 @@ import '../../core/network/abs_sync.dart';
 import '../../core/network/backend_client.dart';
 import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
+import '../../core/providers/playback_progress_provider.dart';
 import '../../core/providers/read_chapters_provider.dart';
 import '../../core/providers/shared_prefs_provider.dart';
 import '../../core/utils/duration_ext.dart';
@@ -30,7 +31,6 @@ class PlayerController extends Notifier<PlayerState> {
 
   // ── ABS progress sync ─────────────────────────────────────────────
   String? _syncItemId;
-  String? _syncMediaId;
   double _syncBookDuration = 0;
   double _syncChapterStart = 0;
   // How far into the current chapter the loaded ClippingAudioSource's clip
@@ -44,11 +44,18 @@ class PlayerController extends Notifier<PlayerState> {
   double _chapterOffsetSeconds = 0;
   int _syncStartedAt = 0;
   Duration _lastPosition = Duration.zero;
-  List<Map<String, dynamic>> _syncAudioTracks = const [];
-  Map<String, dynamic>? _syncLibraryItem;
-  bool _syncDisabled = false;
+  // Backoff for transient sync failures (offline, server briefly down).
+  // Unlike the old all-or-nothing disable, this retries with increasing
+  // delay so sync self-recovers when the server comes back.
   int _syncFailures = 0;
   int _lastSyncMs = 0;
+
+  // ── Local progress persistence ─────────────────────────────────────
+  // Independent of the ABS sync throttle so the user's exact place
+  // survives hard kills and offline sessions (server sync disables itself
+  // after repeated failures). Saved every 5s while playing, on pause, on
+  // chapter change, on dispose/backgrounding, and in _cleanup.
+  Timer? _progressTimer;
 
   // ── VTT cache helpers ──────────────────────────────────────────────
   // Keyed by "vtt_$itemId_$chapterIndex". VTTs are typically 100–400 KB;
@@ -74,7 +81,9 @@ class PlayerController extends Notifier<PlayerState> {
     _positionSub?.cancel();
     _processingSub?.cancel();
     _playingSub?.cancel();
+    _progressTimer?.cancel();
     // Best-effort final progress flush when leaving the player / app.
+    _saveLocalProgress();
     _syncProgress();
   }
 
@@ -95,11 +104,9 @@ class PlayerController extends Notifier<PlayerState> {
 
     // Fresh ABS sync context for this book.
     _syncItemId = itemId;
-    _syncMediaId = null;
     _syncBookDuration = 0;
     _syncChapterStart = 0;
     _chapterOffsetSeconds = 0;
-    _syncDisabled = false;
     _syncFailures = 0;
     _lastSyncMs = 0;
 
@@ -129,6 +136,13 @@ class PlayerController extends Notifier<PlayerState> {
     ]);
 
     _startSyncListener();
+    // Periodically persist position locally (independent of the 10s ABS sync
+    // throttle) so a hard kill never loses more than ~5s of progress.
+    _progressTimer?.cancel();
+    _progressTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => _saveLocalProgress(),
+    );
     await saveLastPlayedChapter(prefs, itemId, chapterIndex);
   }
 
@@ -155,7 +169,8 @@ class PlayerController extends Notifier<PlayerState> {
     }
 
     final isArabic =
-        item.isArabic || (item.language?.toLowerCase().startsWith('ar') ?? false);
+        item.isArabic ||
+        (item.language?.toLowerCase().startsWith('ar') ?? false);
 
     if (item.chapters.isEmpty || item.audioFiles.isEmpty) {
       throw Exception('Book has no chapters or audio files');
@@ -182,10 +197,32 @@ class PlayerController extends Notifier<PlayerState> {
     // range, so this check doesn't need any extra "is this the first
     // load of the session" bookkeeping to stay correct.
     final resumeTarget = item.resumeSeconds;
-    final seekSeconds =
-        (resumeTarget != null && resumeTarget >= chapter.start && resumeTarget < chapter.end)
-            ? resumeTarget
-            : chapter.start;
+    double seekSeconds;
+    if (resumeTarget != null &&
+        resumeTarget >= chapter.start &&
+        resumeTarget < chapter.end) {
+      // ABS is the freshest cross-device source of truth — prefer it.
+      seekSeconds = resumeTarget;
+    } else {
+      // No usable ABS resume point (fresh book, sync disabled/stale after
+      // a failed write, server unreachable) — fall back to this app's
+      // locally persisted position, but only when it belongs to the chapter
+      // we're actually loading. If it belongs to a different chapter (user
+      // tapped a chapter from the list), start at that chapter's top as
+      // usual.
+      final localProgress = BookPlaybackProgress.fromPrefs(
+        ref.read(sharedPrefsProvider),
+        itemId,
+      );
+      if (localProgress != null &&
+          localProgress.chapterIndex == chIndex &&
+          localProgress.positionSeconds > 0 &&
+          localProgress.positionSeconds < chapter.duration) {
+        seekSeconds = chapter.start + localProgress.positionSeconds;
+      } else {
+        seekSeconds = chapter.start;
+      }
+    }
     // How far into the chapter we're resuming — 0 for an ordinary (non-resume)
     // chapter load. Needed below to keep the file's end-boundary anchored to
     // the chapter's real end (not shifted forward by however far we skipped
@@ -211,20 +248,10 @@ class PlayerController extends Notifier<PlayerState> {
 
     // Record everything the ABS progress syncer needs for this book so it can
     // report a position on the whole-book timeline.
-    _syncMediaId = item.mediaId.isEmpty ? null : item.mediaId;
     _syncBookDuration = item.duration;
     _syncChapterStart = chapter.start;
     _chapterOffsetSeconds = chapterOffsetSeconds;
     _syncStartedAt = DateTime.now().millisecondsSinceEpoch;
-    _syncAudioTracks = [
-      for (var i = 0; i < item.audioFiles.length; i++)
-        buildAudioTrack(
-          index: i,
-          filename: item.audioFiles[i].filename,
-          url: '${config.absUrl}/api/items/$itemId/file/${item.audioFiles[i].ino}',
-        ),
-    ];
-    _syncLibraryItem = buildMinifiedLibraryItem(item);
 
     if (offlineBook != null) {
       final audioFile = item.audioFiles.firstWhere(
@@ -390,7 +417,10 @@ class PlayerController extends Notifier<PlayerState> {
   void _applyVtt(String vttContent, {required bool fromCache}) {
     final cues = VttParser.parse(vttContent);
     if (cues.isEmpty) {
-      state = state.copyWith(vttStatus: VttStatus.notFound, transcribeProgress: 0);
+      state = state.copyWith(
+        vttStatus: VttStatus.notFound,
+        transcribeProgress: 0,
+      );
       return;
     }
     state = state.copyWith(
@@ -445,7 +475,9 @@ class PlayerController extends Notifier<PlayerState> {
     if (words.isEmpty) return;
     final word = VttParser.findWordAt(position, words);
     if (word == null) {
-      if (state.currentCueIndex != null) state = state.copyWith(clearWord: true);
+      if (state.currentCueIndex != null) {
+        state = state.copyWith(clearWord: true);
+      }
       return;
     }
     if (word.cueIndex != state.currentCueIndex ||
@@ -457,39 +489,84 @@ class PlayerController extends Notifier<PlayerState> {
     }
   }
 
+  // ── Local progress persistence ──────────────────────────────────────
+
+  /// Persists the current chapter + position to local storage. No-op while
+  /// nothing is loaded (no item or duration known yet). Fire-and-forget: a
+  /// flurry of writes around pause/chapter-switch/dispose is harmless, and
+  /// any intermediate value that gets persisted is still a valid resume
+  /// point.
+  void _saveLocalProgress() {
+    final itemId = state.itemId;
+    if (itemId == null) return;
+    final durMs = state.chapterDuration.inMilliseconds;
+    if (durMs <= 0) return;
+    final posSec = (state.position.inMilliseconds / 1000.0).clamp(
+      0.0,
+      durMs / 1000.0,
+    );
+    unawaited(
+      BookPlaybackProgress.save(
+        ref.read(sharedPrefsProvider),
+        itemId,
+        state.chapterIndex,
+        posSec,
+      ),
+    );
+  }
+
+  /// Best-effort final flush used on app backgrounding / dispose: writes the
+  /// local store AND re-arms + fires the ABS sync so the server gets the
+  /// freshest position too (when reachable).
+  Future<void> flushProgress() async {
+    _saveLocalProgress();
+    _lastSyncMs = 0;
+    _syncProgress();
+  }
+
   // ── ABS progress sync ──────────────────────────────────────────────
 
-  /// Throttled rolling sync — fires at most once per 10s while playing so we
-  /// don't hammer the server, but still keeps ABS up to date.
+  /// Throttled rolling sync — fires at most once per `_backoffSeconds()` while
+  /// playing so we don't hammer the server, but still keeps ABS up to date.
+  /// After a transient failure the throttle backs off (10s → 30s → 60s → …
+  /// capped at 5m) and retries, so sync self-recovers when the server comes
+  /// back.
   void _driftSync() {
-    if (_syncDisabled) return;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    if (nowMs - _lastSyncMs < 10000) return;
+    final backoffMs = 1000 * _backoffSeconds();
+    if (nowMs - _lastSyncMs < backoffMs) return;
     _lastSyncMs = nowMs;
     _syncProgress();
   }
 
+  /// Seconds to wait before the next retry after [_syncFailures] consecutive
+  /// failures. Exponential with a 5-minute cap; resets on success.
+  int _backoffSeconds() {
+    if (_syncFailures <= 0) return 10;
+    final exp = 10 * (1 << (_syncFailures - 1).clamp(0, 5));
+    return exp.clamp(10, 300);
+  }
+
   /// Reports the current book-timeline position to Audiobookshelf.
   void _syncProgress({bool isFinished = false}) {
-    if (_syncDisabled) return;
     final itemId = _syncItemId;
-    final mediaId = _syncMediaId;
-    if (itemId == null || mediaId == null || mediaId.isEmpty) return;
+    if (itemId == null) return;
     final duration = _syncBookDuration;
-    if (duration <= 0 || _syncLibraryItem == null) return;
+    if (duration <= 0) return;
 
     // Player position is inside the chapter clip; chapter.start is the
     // chapter's offset on the whole-book timeline.
     final currentTime =
-        (_syncChapterStart + _lastPosition.inMilliseconds / 1000.0)
-            .clamp(0.0, duration);
+        (_syncChapterStart + _lastPosition.inMilliseconds / 1000.0).clamp(
+          0.0,
+          duration,
+        );
 
     unawaited(
       ref
           .read(progressSyncProvider)
           .reportProgress(
             itemId: itemId,
-            mediaId: mediaId,
             durationSec: duration,
             currentTimeSec: currentTime,
             isFinished: isFinished,
@@ -497,22 +574,17 @@ class PlayerController extends Notifier<PlayerState> {
             finishedAt: isFinished
                 ? DateTime.now().millisecondsSinceEpoch
                 : null,
-            audioTracks: _syncAudioTracks,
-            libraryItem: _syncLibraryItem,
           )
           .then((accepted) {
             if (accepted) {
               _syncFailures = 0;
+              _lastSyncMs = DateTime.now().millisecondsSinceEpoch;
               return;
             }
-            // Two consecutive failures (offline, bad token, unsupported ABS)
-            // → stop trying until the next book is opened.
+            // Transient failure (offline, server down) — bump the backoff so
+            // we don't hammer, then retry on a later tick.
             _syncFailures++;
-            if (_syncFailures >= 2) {
-              _syncDisabled = true;
-              _syncFailures = 0;
-            }
-            _lastSyncMs = 0; // retry on next tick instead of waiting 10s
+            _lastSyncMs = DateTime.now().millisecondsSinceEpoch;
           }),
     );
   }
@@ -523,7 +595,9 @@ class PlayerController extends Notifier<PlayerState> {
     final handler = ref.read(audioHandlerProvider);
     if (handler.player.playing) {
       await handler.pause();
-      // Flush progress immediately on pause so ABS sees where we stopped.
+      // Flush progress immediately on pause so ABS and the local store both
+      // see where we stopped.
+      _saveLocalProgress();
       _lastSyncMs = 0;
       _syncProgress();
     } else {
@@ -548,6 +622,7 @@ class PlayerController extends Notifier<PlayerState> {
         .read(audioHandlerProvider)
         .seek(clipRelative.isNegative ? Duration.zero : clipRelative);
   }
+
   /// Seeks against the whole-book timeline (the top/overall slider in
   /// chapter_scrubber.dart), switching chapters first if [targetSeconds]
   /// lands outside the currently-loaded chapter.
@@ -565,16 +640,17 @@ class PlayerController extends Notifier<PlayerState> {
     }
   }
 
-  Future<void> skipForward15() => ref.read(audioHandlerProvider).skipForward15();
-  Future<void> skipForward30() => ref.read(audioHandlerProvider).skipForward30();
-  Future<void> skipBackward15() => ref.read(audioHandlerProvider).skipBackward15();
+  Future<void> skipForward15() =>
+      ref.read(audioHandlerProvider).skipForward15();
+  Future<void> skipForward30() =>
+      ref.read(audioHandlerProvider).skipForward30();
+  Future<void> skipBackward15() =>
+      ref.read(audioHandlerProvider).skipBackward15();
 
   Future<void> setSpeed(double speed) async {
     await ref.read(audioHandlerProvider).setSpeed(speed);
     state = state.copyWith(speed: speed);
-    await ref
-        .read(sharedPrefsProvider)
-        .setDouble(kPlaybackSpeedKey, speed);
+    await ref.read(sharedPrefsProvider).setDouble(kPlaybackSpeedKey, speed);
   }
 
   /// Enters/exits immersive read-along mode. The system-bar transitions and
@@ -591,13 +667,24 @@ class PlayerController extends Notifier<PlayerState> {
     await setSpeed(next);
   }
 
+  /// Nudges the current playback speed up/down for the − / + steppers,
+  /// clamped to the same bounds as the fine-control sheet (0.5×–3.0×) and
+  /// rounded to the sheet's 0.05× step so the slider/presets stay in sync.
+  Future<void> adjustSpeed(double delta) async {
+    final next = (state.speed + delta).clamp(0.5, 3.0);
+    await setSpeed((next * 20).round() / 20);
+  }
+
   Future<void> switchChapter(int newIndex) async {
     final itemId = state.itemId;
     if (itemId == null) return;
-    // Persist where the previous chapter left off.
+    // Persist where the previous chapter left off, both locally and (when
+    // reachable) to ABS.
+    _saveLocalProgress();
     _lastSyncMs = 0;
     _syncProgress();
     _vttPollTimer?.cancel();
+    _progressTimer?.cancel();
     state = const PlayerState();
     _loadedChapterIndex = -1;
     await init(itemId, newIndex);
@@ -616,7 +703,8 @@ class PlayerController extends Notifier<PlayerState> {
     // Persist the "listened" flag for this chapter.
     final itemId = state.itemId;
     if (itemId != null) {
-      ref.read(readChaptersProvider.notifier)
+      ref
+          .read(readChaptersProvider.notifier)
           .markListened(itemId, state.chapterIndex);
     }
 
@@ -670,11 +758,14 @@ class PlayerController extends Notifier<PlayerState> {
     if (!ref.read(configProvider).backendConfigured) return false;
     final backend = ref.read(backendClientProvider);
     try {
-      final res = await backend.post('/api/transcribe', data: {
-        'abs_item_id': itemId,
-        'mode': 'chapter',
-        'chapter_index': state.chapterIndex,
-      });
+      final res = await backend.post(
+        '/api/transcribe',
+        data: {
+          'abs_item_id': itemId,
+          'mode': 'chapter',
+          'chapter_index': state.chapterIndex,
+        },
+      );
       final code = res.statusCode ?? 500;
       final ok = code == 202 || code < 300;
       if (ok) {
@@ -688,5 +779,6 @@ class PlayerController extends Notifier<PlayerState> {
   }
 }
 
-final playerProvider =
-    NotifierProvider<PlayerController, PlayerState>(PlayerController.new);
+final playerProvider = NotifierProvider<PlayerController, PlayerState>(
+  PlayerController.new,
+);

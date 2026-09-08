@@ -59,37 +59,67 @@ class SpeedSheet extends ConsumerWidget {
               ],
             ),
             const SizedBox(height: 4),
-            SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                trackHeight: 3,
-                thumbColor: AppColors.primary,
-                activeTrackColor: AppColors.primary,
-                inactiveTrackColor: AppColors.surfaceElevated,
-                thumbShape:
-                    const RoundSliderThumbShape(enabledThumbRadius: 7),
-                overlayShape:
-                    const RoundSliderOverlayShape(overlayRadius: 16),
-              ),
-              child: Slider(
-                value: player.speed.clamp(0.5, 3.0),
-                min: 0.5,
-                max: 3.0,
-                divisions: 50, // 0.05x steps
-                onChanged: (v) =>
-                    notifier.setSpeed((v * 20).round() / 20),
-              ),
+            Row(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.remove_rounded),
+                  tooltip: 'Slower',
+                  color: AppColors.textPrimary,
+                  iconSize: 22,
+                  onPressed: () => notifier.adjustSpeed(-0.05),
+                ),
+                Expanded(
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      trackHeight: 3,
+                      thumbColor: AppColors.primary,
+                      activeTrackColor: AppColors.primary,
+                      inactiveTrackColor: AppColors.surfaceElevated,
+                      thumbShape: const RoundSliderThumbShape(
+                        enabledThumbRadius: 7,
+                      ),
+                      overlayShape: const RoundSliderOverlayShape(
+                        overlayRadius: 16,
+                      ),
+                    ),
+                    child: Slider(
+                      value: player.speed.clamp(0.5, 3.0),
+                      min: 0.5,
+                      max: 3.0,
+                      divisions: 50, // 0.05x steps
+                      onChanged: (v) =>
+                          notifier.setSpeed((v * 20).round() / 20),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.add_rounded),
+                  tooltip: 'Faster',
+                  color: AppColors.textPrimary,
+                  iconSize: 22,
+                  onPressed: () => notifier.adjustSpeed(0.05),
+                ),
+              ],
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 4),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: const [
-                  Text('0.5×',
-                      style: TextStyle(
-                          color: AppColors.textSecondary, fontSize: 11)),
-                  Text('3.0×',
-                      style: TextStyle(
-                          color: AppColors.textSecondary, fontSize: 11)),
+                  Text(
+                    '0.5×',
+                    style: TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 11,
+                    ),
+                  ),
+                  Text(
+                    '3.0×',
+                    style: TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 11,
+                    ),
+                  ),
                 ],
               ),
             ),

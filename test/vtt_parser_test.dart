@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ereader/core/utils/vtt_parser.dart';
+import 'package:echoread/core/utils/vtt_parser.dart';
 
 void main() {
   const sampleVtt = '''WEBVTT

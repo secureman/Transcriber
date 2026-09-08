@@ -40,7 +40,7 @@ class AudioControls extends ConsumerWidget {
             onTap: () => notifier.skipForward30(),
             tooltip: 'Forward 30s',
           ),
-          const _SpeedChip(),
+          const _SpeedStepper(),
         ],
       ),
     );
@@ -158,38 +158,92 @@ class _PlayPauseButton extends ConsumerWidget {
   }
 }
 
-class _SpeedChip extends ConsumerWidget {
-  const _SpeedChip();
+/// Playback speed stepper: a [−] / [+] pair around the speed label. The
+/// label still opens the fine-control sheet on long-press (and cycles presets
+/// on a plain tap); the buttons nudge the speed up/down by 0.1× without
+/// leaving the control row.
+class _SpeedStepper extends ConsumerWidget {
+  const _SpeedStepper();
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final player = ref.watch(playerProvider);
     final notifier = ref.read(playerProvider.notifier);
 
-    return Tooltip(
-      message: 'Tap to cycle, long-press for fine control',
-      child: GestureDetector(
-        onTap: () => notifier.cycleSpeed(),
-        onLongPress: () => showModalBottomSheet<void>(
-          context: context,
-          backgroundColor: AppColors.surface,
-          shape: const RoundedRectangleBorder(
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
-          builder: (_) => const SpeedSheet(),
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _SpeedStepButton(
+          icon: Icons.remove_rounded,
+          tooltip: 'Slower',
+          onPressed: () => notifier.adjustSpeed(-0.1),
         ),
-        child: Text(
-          '${_formatSpeed(player.speed)}×',
-          style: const TextStyle(
-            color: AppColors.textPrimary,
-            fontSize: 15,
-            fontWeight: FontWeight.w600,
+        Tooltip(
+          message: 'Tap to cycle, long-press for fine control',
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => notifier.cycleSpeed(),
+            onLongPress: () => showModalBottomSheet<void>(
+              context: context,
+              backgroundColor: AppColors.surface,
+              shape: const RoundedRectangleBorder(
+                borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+              ),
+              builder: (_) => const SpeedSheet(),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 2),
+              child: Text(
+                '${_formatSpeed(player.speed)}×',
+                style: const TextStyle(
+                  color: AppColors.textPrimary,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
           ),
+        ),
+        _SpeedStepButton(
+          icon: Icons.add_rounded,
+          tooltip: 'Faster',
+          onPressed: () => notifier.adjustSpeed(0.1),
+        ),
+      ],
+    );
+  }
+
+  String _formatSpeed(double speed) => speed == speed.roundToDouble()
+      ? speed.toStringAsFixed(1)
+      : speed.toString();
+}
+
+/// Compact circular-invisible speed nudge button, sized to fit the control
+/// row without pushing the other buttons off narrow screens.
+class _SpeedStepButton extends StatelessWidget {
+  const _SpeedStepButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: InkResponse(
+        onTap: onPressed,
+        radius: 22,
+        child: SizedBox(
+          width: 28,
+          height: 40,
+          child: Icon(icon, size: 20, color: AppColors.textSecondary),
         ),
       ),
     );
   }
-
-  String _formatSpeed(double speed) =>
-      speed == speed.roundToDouble() ? speed.toStringAsFixed(1) : speed.toString();
 }

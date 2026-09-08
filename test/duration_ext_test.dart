@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ereader/core/utils/duration_ext.dart';
+import 'package:echoread/core/utils/duration_ext.dart';
 
 void main() {
   group('atPlaybackSpeed (ABS-style time-remaining adjustment)', () {

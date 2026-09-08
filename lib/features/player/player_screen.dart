@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
 
@@ -34,15 +35,34 @@ class PlayerScreen extends ConsumerStatefulWidget {
   ConsumerState<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends ConsumerState<PlayerScreen> {
+class _PlayerScreenState extends ConsumerState<PlayerScreen>
+    with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref
           .read(playerProvider.notifier)
           .init(widget.itemId, widget.chapterIndex);
     });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Flush the reading/listening position whenever the app is backgrounded
+    // or hidden — a killed Android process won't get a clean notifyFromDispose.
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      unawaited(ref.read(playerProvider.notifier).flushProgress());
+    }
   }
 
   @override
@@ -93,7 +113,6 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                 children: [
                   _AppBar(itemId: widget.itemId, fullscreen: fullscreen),
                   Expanded(child: _ReaderContainer(fullscreen: fullscreen)),
-                  if (fullscreen) const _FullscreenChapterProgress(),
                   if (!fullscreen && player.finished)
                     Padding(
                       padding: const EdgeInsets.symmetric(
@@ -128,7 +147,9 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                   if (!fullscreen) ...[
                     Padding(
                       padding: EdgeInsets.symmetric(
-                        horizontal: MediaQuery.sizeOf(context).width < 380 ? 8 : 16,
+                        horizontal: MediaQuery.sizeOf(context).width < 380
+                            ? 8
+                            : 16,
                       ),
                       child: const ChapterScrubber(),
                     ),
@@ -148,35 +169,146 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
   }
 }
 
-/// The reading-area container. Normal mode: an inset rounded card tinted
-/// with the reader theme's background. Fullscreen: edge-to-edge with no
-/// rounding or margins, so the transcript owns the whole screen.
-class _FullscreenChapterProgress extends ConsumerWidget {
-  const _FullscreenChapterProgress();
+/// Fullscreen chapter progress, shown as a slim vertical strip down the left
+/// edge instead of a bottom bar.
+///
+/// A plain, dim bar: a thin rail with a short fill that grows from the top
+/// down to the current progress position. Deliberately low-key — no glow, no
+/// bright core. Drawn by a single [CustomPainter], with the playhead's
+/// movement animated via [TweenAnimationBuilder] so seeks glide.
+class _FullscreenProgressStrip extends ConsumerWidget {
+  const _FullscreenProgressStrip({required this.theme});
+
+  final ReaderThemeData theme;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final player = ref.watch(playerProvider);
-    final duration = player.chapterDuration.inMilliseconds;
-    final progress = duration <= 0
+    final notifier = ref.read(playerProvider.notifier);
+    final durationMs = player.chapterDuration.inMilliseconds;
+    final progress = durationMs <= 0
         ? 0.0
-        : (player.position.inMilliseconds / duration).clamp(0.0, 1.0);
-    return SafeArea(
-      top: false,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(2),
-          child: LinearProgressIndicator(
-            minHeight: 2,
-            value: progress,
-            backgroundColor: Colors.white.withValues(alpha: 0.22),
-            valueColor: const AlwaysStoppedAnimation(AppColors.primary),
+        : (player.position.inMilliseconds / durationMs).clamp(0.0, 1.0);
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final trackHeight = constraints.maxHeight;
+
+        // Tap / drag anywhere on the strip to seek — the same scrubbing
+        // interaction the old bottom progress bar offered, just vertical.
+        void seekFrom(Offset local) {
+          if (trackHeight <= 0 || player.chapterDuration == Duration.zero) {
+            return;
+          }
+          final frac = (local.dy / trackHeight).clamp(0.0, 1.0).toDouble();
+          notifier.seekTo(
+            Duration(
+              milliseconds: (player.chapterDuration.inMilliseconds * frac)
+                  .round(),
+            ),
+          );
+        }
+
+        return Semantics(
+          label: 'Chapter progress',
+          value: '${(progress * 100).round()}%',
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapDown: (d) => seekFrom(d.localPosition),
+            onVerticalDragStart: (d) => seekFrom(d.localPosition),
+            onVerticalDragUpdate: (d) => seekFrom(d.localPosition),
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(end: progress),
+              duration: const Duration(milliseconds: 600),
+              curve: Curves.easeOutSine,
+              builder: (context, value, _) => CustomPaint(
+                painter: _ProgressStripPainter(
+                  progress: value.clamp(0.0, 1.0).toDouble(),
+                  accent: theme.highlightBg,
+                  track: theme.text.withValues(
+                    alpha: theme.isDark ? 0.10 : 0.16,
+                  ),
+                ),
+                child: const SizedBox.expand(),
+              ),
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
+}
+
+/// Paints the simple vertical progress strip: a dim full-height rail and a
+/// slightly brighter (still dim) fill from the top down to the current
+/// progress position.
+class _ProgressStripPainter extends CustomPainter {
+  _ProgressStripPainter({
+    required this.progress,
+    required this.accent,
+    required this.track,
+  });
+
+  final double progress; // 0 (start) → 1 (end of chapter)
+  final Color accent;
+  final Color track;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.height <= 0) return;
+    final centerX = size.width / 2;
+    const width = 3.0;
+    const radius = Radius.circular(1.5);
+
+    // Dim rail spanning the fullscreen height — dimmer at both ends, a bit
+    // brighter around the vertical middle.
+    final rail = RRect.fromRectAndRadius(
+      Rect.fromCenter(
+        center: Offset(centerX, size.height / 2),
+        width: width,
+        height: size.height,
+      ),
+      radius,
+    );
+    canvas.save();
+    canvas.clipRRect(rail, doAntiAlias: true);
+    canvas.restore();
+    canvas.drawRRect(rail, Paint()..color = track);
+
+    // Progress fill from the top down to the current position. The lit band
+    // is a gradient peaked at the strip's vertical middle and fading toward
+    // the top and bottom ends — dimmer at the ends, a bit brighter in the
+    // middle. Clip the fill to the rail so it never spills outside the strip.
+    final fillH = (size.height * progress).clamp(0.0, size.height).toDouble();
+    if (fillH <= 0) return;
+    final lit = RRect.fromRectAndRadius(
+      Rect.fromLTWH(centerX - width / 2, 0, width, fillH),
+      radius,
+    );
+    canvas.save();
+    canvas.clipRRect(lit, doAntiAlias: true);
+    canvas.restore();
+    canvas.drawRRect(
+      lit,
+      Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          stops: const [0.0, 0.45, 0.5, 0.55, 1.0],
+          colors: [
+            accent.withValues(alpha: 0.0),
+            accent.withValues(alpha: 0.20),
+            accent.withValues(alpha: 0.32),
+            accent.withValues(alpha: 0.20),
+            accent.withValues(alpha: 0.0),
+          ],
+        ).createShader(lit.outerRect),
+    );
+  }
+
+  @override
+  bool shouldRepaint(_ProgressStripPainter old) =>
+      old.progress != progress || old.accent != accent || old.track != track;
 }
 
 class _ReaderContainer extends ConsumerWidget {
@@ -187,6 +319,29 @@ class _ReaderContainer extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final t = ReaderThemeData.all[ref.watch(readerThemeProvider)]!;
+    final Widget content;
+    if (fullscreen) {
+      // Fullscreen: the old bottom chapter bar is replaced by a slim
+      // vertical progress strip docked to the left edge — it never
+      // overlaps the read-along text (which pads further left in
+      // fullscreen) and doesn't fight the system-back handling since it
+      // sits inside the reader area.
+      content = Stack(
+        fit: StackFit.expand,
+        children: [
+          const ReadingView(),
+          Positioned(
+            top: 8,
+            bottom: 8,
+            left: 6,
+            width: 26,
+            child: _FullscreenProgressStrip(theme: t),
+          ),
+        ],
+      );
+    } else {
+      content = const ReadingView();
+    }
     return Container(
       margin: fullscreen
           ? EdgeInsets.zero
@@ -203,7 +358,7 @@ class _ReaderContainer extends ConsumerWidget {
             ? BorderRadius.zero
             : BorderRadius.circular(AppColors.cardRadius),
       ),
-      child: const ReadingView(),
+      child: content,
     );
   }
 }
