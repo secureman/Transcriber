@@ -91,7 +91,7 @@ class EReaderApp extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final router = ref.watch(routerProvider);
     return MaterialApp.router(
-      title: 'EReader',
+      title: 'Echoread',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.dark,
       routerConfig: router,

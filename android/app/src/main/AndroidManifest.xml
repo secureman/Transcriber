@@ -19,7 +19,7 @@
         this and the networkSecurityConfig.
     -->
     <application
-        android:label="EReader"
+        android:label="Echoread"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true"

@@ -1,4 +1,4 @@
-# ereader
+# Echoread
 
 Audiobookshelf client app (Flutter) with karaoke-style read-along
 transcription, powered by a self-hosted transcription server
