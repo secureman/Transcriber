@@ -8,9 +8,9 @@ import '../player_state.dart';
 import 'chapter_sheet.dart';
 
 
-/// Chapter-name pill + scrubber + three-label time row (ElevenReader style):
-/// elapsed-in-book on the left, time-left-in-book in the center, time-left
-/// in the current chapter on the right.
+/// Chapter-name pill + scrubber + Audiobookshelf-style time rows.
+/// The first row is the whole-book clock and the second is the current chapter
+/// clock. Both clocks show listening time, so they respect playback speed.
 class ChapterScrubber extends ConsumerWidget {
   const ChapterScrubber({super.key});
 
@@ -21,33 +21,29 @@ class ChapterScrubber extends ConsumerWidget {
     final meta = player.itemId == null
         ? null
         : ref.watch(bookMetaProvider(player.itemId!)).valueOrNull;
-
     final maxMs = player.chapterDuration.inMilliseconds;
     final value = player.position.inMilliseconds
         .clamp(0, maxMs == 0 ? 1 : maxMs)
         .toDouble();
-
-    final elapsedInBook =
-        (player.chapterStartInBook + player.position.inMilliseconds / 1000.0)
-            .asDuration;
-    // Time-remaining labels are speed-adjusted (ABS-style): 10 minutes of
-    // audio at 2× means 5 minutes of listening left.
     final speed = player.speed;
-    final leftInBook = atPlaybackSpeed(
-      (player.bookDurationSeconds -
-              player.chapterStartInBook -
-              player.position.inMilliseconds / 1000.0)
+    final bookElapsed = atPlaybackSpeed(
+      (player.chapterStartInBook + player.position.inMilliseconds / 1000.0)
           .clamp(0, double.infinity)
           .toDouble()
           .asDuration,
       speed,
     );
-    final leftInChapterRaw = player.chapterDuration - player.position;
-    final leftInChapter = atPlaybackSpeed(
-      leftInChapterRaw.isNegative ? Duration.zero : leftInChapterRaw,
+    final bookTotal = atPlaybackSpeed(
+      player.bookDurationSeconds.clamp(0, double.infinity).toDouble().asDuration,
       speed,
     );
-
+    final bookRemaining = bookTotal - bookElapsed;
+    final chapterElapsed = atPlaybackSpeed(
+      player.position.isNegative ? Duration.zero : player.position,
+      speed,
+    );
+    final chapterTotal = atPlaybackSpeed(player.chapterDuration, speed);
+    final chapterRemaining = chapterTotal - chapterElapsed;
     final chapterTitle = (meta != null &&
             player.chapterIndex >= 0 &&
             player.chapterIndex < meta.chapters.length)
@@ -75,10 +71,7 @@ class ChapterScrubber extends ConsumerWidget {
               const Icon(Icons.menu_rounded,
                   size: 15, color: AppColors.textSecondary),
               const SizedBox(width: 6),
-              ConstrainedBox(
-                constraints: BoxConstraints(
-                  maxWidth: MediaQuery.of(context).size.width * 0.7,
-                ),
+              Flexible(
                 child: Text(
                   chapterTitle,
                   maxLines: 1,
@@ -111,31 +104,56 @@ class ChapterScrubber extends ConsumerWidget {
                 : (v) => notifier.seekTo(Duration(milliseconds: v.toInt())),
           ),
         ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 20),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                elapsedInBook.mmss,
-                style: const TextStyle(
-                    color: AppColors.textSecondary, fontSize: 12),
-              ),
-              if (player.bookDurationSeconds > 0)
-                Text(
-                  '${leftInBook.humanReadable} left',
-                  style: const TextStyle(
-                      color: AppColors.textSecondary, fontSize: 12),
-                ),
-              Text(
-                leftInChapter.mmss,
-                style: const TextStyle(
-                    color: AppColors.textSecondary, fontSize: 12),
-              ),
-            ],
-          ),
+        _TimeRow(
+          label: 'Overall',
+          elapsed: bookElapsed,
+          remaining: bookRemaining.isNegative ? Duration.zero : bookRemaining,
+          total: bookTotal,
+        ),
+        const SizedBox(height: 3),
+        _TimeRow(
+          label: 'Chapter',
+          elapsed: chapterElapsed,
+          remaining:
+              chapterRemaining.isNegative ? Duration.zero : chapterRemaining,
+          total: chapterTotal,
         ),
       ],
+    );
+  }
+}
+
+class _TimeRow extends StatelessWidget {
+  const _TimeRow({
+    required this.label,
+    required this.elapsed,
+    required this.remaining,
+    required this.total,
+  });
+
+  final String label;
+  final Duration elapsed;
+  final Duration remaining;
+  final Duration total;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = TextStyle(
+      color: AppColors.textSecondary,
+      fontSize: MediaQuery.sizeOf(context).width < 360 ? 11 : 12,
+    );
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: Row(
+        children: [
+          SizedBox(width: 58, child: Text(label, style: style)),
+          Text(elapsed.mmss, style: style),
+          const Spacer(),
+          Text('-${remaining.mmss}', style: style),
+          const SizedBox(width: 5),
+          Text('/ ${total.mmss}', style: style),
+        ],
+      ),
     );
   }
 }

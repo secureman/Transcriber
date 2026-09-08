@@ -20,10 +20,11 @@ class AudioControls extends ConsumerWidget {
     final player = ref.watch(playerProvider);
     final notifier = ref.read(playerProvider.notifier);
 
+    final compact = MediaQuery.sizeOf(context).width < 360;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8),
+      padding: EdgeInsets.symmetric(horizontal: compact ? 2 : 8),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
           _SleepButton(active: player.sleepTimer != SleepTimerState.off),
           _SkipButton(

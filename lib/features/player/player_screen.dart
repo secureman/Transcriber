@@ -93,6 +93,7 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                 children: [
                   _AppBar(itemId: widget.itemId, fullscreen: fullscreen),
                   Expanded(child: _ReaderContainer(fullscreen: fullscreen)),
+                  if (fullscreen) const _FullscreenChapterProgress(),
                   if (!fullscreen && player.finished)
                     Padding(
                       padding: const EdgeInsets.symmetric(
@@ -125,15 +126,17 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
                       ),
                     ),
                   if (!fullscreen) ...[
-                    const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 16),
-                      child: ChapterScrubber(),
+                    Padding(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: MediaQuery.sizeOf(context).width < 380 ? 8 : 16,
+                      ),
+                      child: const ChapterScrubber(),
                     ),
-                    const SizedBox(height: 10),
-                    const AudioControls(),
                     const SizedBox(height: 8),
+                    const AudioControls(),
+                    const SizedBox(height: 4),
                     const PlayerAccessoryRow(),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 8),
                   ],
                 ],
               ),
@@ -148,6 +151,34 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen> {
 /// The reading-area container. Normal mode: an inset rounded card tinted
 /// with the reader theme's background. Fullscreen: edge-to-edge with no
 /// rounding or margins, so the transcript owns the whole screen.
+class _FullscreenChapterProgress extends ConsumerWidget {
+  const _FullscreenChapterProgress();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final player = ref.watch(playerProvider);
+    final duration = player.chapterDuration.inMilliseconds;
+    final progress = duration <= 0
+        ? 0.0
+        : (player.position.inMilliseconds / duration).clamp(0.0, 1.0);
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(2),
+          child: LinearProgressIndicator(
+            minHeight: 2,
+            value: progress,
+            backgroundColor: Colors.white.withValues(alpha: 0.22),
+            valueColor: const AlwaysStoppedAnimation(AppColors.primary),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ReaderContainer extends ConsumerWidget {
   final bool fullscreen;
 
@@ -159,7 +190,12 @@ class _ReaderContainer extends ConsumerWidget {
     return Container(
       margin: fullscreen
           ? EdgeInsets.zero
-          : const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          : EdgeInsets.fromLTRB(
+              MediaQuery.sizeOf(context).width < 380 ? 10 : 16,
+              8,
+              MediaQuery.sizeOf(context).width < 380 ? 10 : 16,
+              8,
+            ),
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
         color: t.background,
