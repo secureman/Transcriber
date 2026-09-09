@@ -10,6 +10,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
+import '../../core/providers/read_chapters_provider.dart';
 import '../../core/providers/reader_theme_provider.dart';
 import '../../core/theme/app_theme.dart';
 import 'player_provider.dart';
@@ -190,6 +191,21 @@ class _FullscreenProgressStrip extends ConsumerWidget {
         ? 0.0
         : (player.position.inMilliseconds / durationMs).clamp(0.0, 1.0);
 
+    // Where the user last stopped in this book (local playback-progress
+    // store). When it belongs to the chapter being displayed, it's drawn as
+    // a small tick on the strip — so even after seeking away, pausing, or
+    // killing the app, you can see how far you got last time.
+    final itemId = player.itemId;
+    final saved = itemId == null
+        ? null
+        : ref.read(readChaptersProvider.notifier).lastPosition(itemId);
+    final savedFraction =
+        (saved != null &&
+            saved.chapterIndex == player.chapterIndex &&
+            durationMs > 0)
+        ? (saved.positionSeconds / (durationMs / 1000.0)).clamp(0.0, 1.0)
+        : 0.0;
+
     return LayoutBuilder(
       builder: (context, constraints) {
         final trackHeight = constraints.maxHeight;
@@ -224,6 +240,7 @@ class _FullscreenProgressStrip extends ConsumerWidget {
               builder: (context, value, _) => CustomPaint(
                 painter: _ProgressStripPainter(
                   progress: value.clamp(0.0, 1.0).toDouble(),
+                  savedProgress: savedFraction,
                   accent: theme.highlightBg,
                   track: theme.text.withValues(
                     alpha: theme.isDark ? 0.10 : 0.16,
@@ -245,11 +262,13 @@ class _FullscreenProgressStrip extends ConsumerWidget {
 class _ProgressStripPainter extends CustomPainter {
   _ProgressStripPainter({
     required this.progress,
+    required this.savedProgress,
     required this.accent,
     required this.track,
   });
 
   final double progress; // 0 (start) → 1 (end of chapter)
+  final double savedProgress; // last stop position from a previous session
   final Color accent;
   final Color track;
 
@@ -285,9 +304,6 @@ class _ProgressStripPainter extends CustomPainter {
       Rect.fromLTWH(centerX - width / 2, 0, width, fillH),
       radius,
     );
-    canvas.save();
-    canvas.clipRRect(lit, doAntiAlias: true);
-    canvas.restore();
     canvas.drawRRect(
       lit,
       Paint()
@@ -304,11 +320,25 @@ class _ProgressStripPainter extends CustomPainter {
           ],
         ).createShader(lit.outerRect),
     );
+
+    // A tick marking where the user last stopped in this chapter (from the
+    // playback-progress store) — only when it's meaningfully behind the
+    // current position (i.e. it's from a previous session, not live data).
+    if (savedProgress > 0 && savedProgress < progress - 0.005) {
+      final tickY = (size.height * savedProgress).clamp(0.0, size.height);
+      canvas.drawRect(
+        Rect.fromLTWH(centerX - width / 2 - 1.5, tickY - 1.0, width + 3, 2.0),
+        Paint()..color = track.withValues(alpha: track.a < 0.2 ? 1.0 : 0.5),
+      );
+    }
   }
 
   @override
   bool shouldRepaint(_ProgressStripPainter old) =>
-      old.progress != progress || old.accent != accent || old.track != track;
+      old.progress != progress ||
+      old.savedProgress != savedProgress ||
+      old.accent != accent ||
+      old.track != track;
 }
 
 class _ReaderContainer extends ConsumerWidget {

@@ -106,6 +106,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Server shutting down, stopping workers")
     await job_queue.stop_workers()
+    await groq_client.close_client()
 
 
 app = FastAPI(title="Audiobook Transcription Server", lifespan=lifespan)

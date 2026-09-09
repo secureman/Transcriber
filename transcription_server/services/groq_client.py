@@ -1,58 +1,97 @@
+"""Groq Whisper client — plain httpx, no `groq` SDK.
+
+The official `groq` package hard-depends on pydantic v2 (compiled
+pydantic-core), which has no prebuilt wheels for Termux/Android. This module
+speaks the same HTTP API directly with httpx (already a dependency), keeping
+the whole server installable with pure-Python wheels only.
+
+Used by: routers/transcribe.py (job pipeline) and main.py (/api/check/groq).
+"""
+
 import asyncio
 import logging
-import os
 from typing import Any, Optional
 
-# `groq` is only needed at transcription time. Importing lazily lets the
-# server boot (and respond to /api/health, /api/jobs/active, etc.) on a
-# machine that doesn't have it installed yet — useful for first-run setup.
-try:
-    import groq
-    from groq import AsyncGroq
-    _GROQ_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    groq = None  # type: ignore[assignment]
-    AsyncGroq = None  # type: ignore[assignment,misc]
-    _GROQ_AVAILABLE = False
+import httpx
 
 from config import settings
 
 logger = logging.getLogger("groq")
 
+_API_BASE = "https://api.groq.com/openai/v1"
 MODEL = settings.GROQ_MODEL
-
-# Lazy client — don't construct at import time, so the server can boot
-# without a key set (useful for health checks and smoke tests).
-_client: Optional[Any] = None
 
 # Caps parallel Groq API calls across all jobs/chapters.
 _groq_semaphore = asyncio.Semaphore(max(1, settings.MAX_CONCURRENT_GROQ))
 
+# Shared async client (connection pooling). Created lazily so the server can
+# boot without any network access and so tests can swap it easily.
+_client: Optional[httpx.AsyncClient] = None
 
-def _get_client() -> Any:
-    global _client
-    if not _GROQ_AVAILABLE:
+
+def _headers() -> dict:
+    if not settings.GROQ_API_KEY:
         raise RuntimeError(
-            "The 'groq' package is not installed. "
-            "Run: pip install groq")
-    if _client is None:
-        if not settings.GROQ_API_KEY:
-            raise RuntimeError(
-                "GROQ_API_KEY is empty — set it in .env before transcribing")
-        _client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+            "GROQ_API_KEY is empty — set it in .env before transcribing")
+    return {"Authorization": f"Bearer {settings.GROQ_API_KEY}"}
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
     return _client
+
+
+async def close_client() -> None:
+    """Closes the shared client (called on app shutdown)."""
+    global _client
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+    _client = None
+
+
+# ── Error taxonomy (mirrors the exception classes the groq SDK exposed) ──
+
+class GroqAuthError(Exception):
+    """401/403 — the API key is missing, malformed or revoked."""
+
+
+class GroqRateLimitError(Exception):
+    """429 — per-minute/hour caps or quota exhausted."""
+
+
+class GroqTransientError(Exception):
+    """Connection failures, 5xx and other retryable server errors."""
+
+
+def _classify(status: Optional[int]) -> Optional[type[Exception]]:
+    if status in (401, 403):
+        return GroqAuthError
+    if status == 429:
+        return GroqRateLimitError
+    if status is None or status >= 500:
+        return GroqTransientError
+    return None
+
+
+def _raise_for_status(status: Optional[int], detail: str) -> None:
+    exc_type = _classify(status)
+    if exc_type is not None:
+        raise exc_type(detail)
+    if status is not None and status >= 400:
+        raise RuntimeError(f"Groq API error (HTTP {status}): {detail}")
 
 
 async def check_access() -> dict:
     """Validates the Groq API key and network reachability without burning
     transcription quota.
 
-    Uses ``models.list()``, a lightweight read call: it proves the key is
-    accepted and the account reachable, but does NOT prove transcription
-    quota remains. Free-plan per-minute/hour caps only surface as 429s
-    during an actual job, which ``_create_with_retry`` turns into a clear
-    error on the job row (and every chunk upload already re-checks auth, so
-    a revoked key fails fast there too).
+    Uses GET /models, a lightweight read call: it proves the key is accepted
+    and the account reachable, but does NOT prove transcription quota
+    remains. Free-plan per-minute/hour caps only surface as 429s during an
+    actual job, which `_transcribe_with_retry` turns into a clear error on
+    the job row.
     """
     if not settings.GROQ_API_KEY:
         return {
@@ -62,32 +101,40 @@ async def check_access() -> dict:
             "detail": "GROQ_API_KEY is empty — set it in .env",
         }
     try:
-        client = _get_client()
-        await client.models.list()
+        response = await _get_client().get(
+            f"{_API_BASE}/models", headers=_headers())
+    except httpx.HTTPError as e:
+        return {
+            "ok": False, "check": "groq",
+            "label": "Unreachable",
+            "detail": f"Groq API not reachable: {e}",
+        }
     except RuntimeError as e:
         return {
             "ok": False, "check": "groq",
             "label": "Package not installed", "detail": str(e),
         }
-    except groq.AuthenticationError as e:
+    try:
+        _raise_for_status(response.status_code, response.text[:300])
+    except GroqAuthError as e:
         return {
             "ok": False, "check": "groq",
             "label": "Invalid API key",
             "detail": (f"Groq rejected the API key: {e}. "
                        "Check GROQ_API_KEY in .env"),
         }
-    except groq.RateLimitError as e:
+    except GroqRateLimitError as e:
         return {
             "ok": False, "check": "groq",
             "label": "Rate limited / quota",
             "detail": (f"Groq rate-limited the request (free-plan caps or "
                        f"quota exhausted): {e}"),
         }
-    except (groq.APIConnectionError, groq.InternalServerError) as e:
+    except GroqTransientError as e:
         return {
             "ok": False, "check": "groq",
             "label": "Unreachable",
-            "detail": f"Groq API not reachable: {e}",
+            "detail": f"Groq API error: {e}",
         }
     except Exception as e:  # noqa: BLE001 — surface any unexpected failure
         logger.warning("check_access: unexpected error: %s", e)
@@ -98,33 +145,36 @@ async def check_access() -> dict:
     return {
         "ok": True, "check": "groq",
         "label": "OK",
-        "detail": "Groq key accepted (models.list() succeeded). "
+        "detail": "Groq key accepted (GET /models succeeded). "
                   "Transcription quota itself is only confirmed per-job.",
     }
 
 
-async def _create_with_retry(audio_path: str) -> list[dict]:
+async def _transcribe_with_retry(audio_path: str) -> list[dict]:
     """Groq transcription with exponential-backoff rate limit retries.
 
     Auth errors (bad API key) are NOT retried — fail fast so the user
     sees a clear error instead of waiting 7s for 3 doomed attempts.
     """
-    if not _GROQ_AVAILABLE:
-        raise RuntimeError(
-            "The 'groq' package is not installed. Run: pip install groq")
-    client = _get_client()
+    headers = _headers()
     for attempt in range(3):
+        response = None
         try:
             async with _groq_semaphore:
                 with open(audio_path, "rb") as f:
-                    response = await client.audio.transcriptions.create(
-                        model=MODEL,
-                        file=f,
-                        response_format="verbose_json",
-                        timestamp_granularities=["word"],
+                    response = await _get_client().post(
+                        f"{_API_BASE}/audio/transcriptions",
+                        headers=headers,
+                        files={"file": (audio_path, f, "audio/mpeg")},
+                        data={
+                            "model": MODEL,
+                            "response_format": "verbose_json",
+                            "timestamp_granularities[]": "word",
+                        },
                     )
-            # Groq's verbose_json returns dicts in response.words.
-            words = response.words or []
+            _raise_for_status(response.status_code, response.text[:300])
+            payload = response.json()
+            words = payload.get("words") or []
             return [
                 {
                     "word": w.get("word", ""),
@@ -134,30 +184,29 @@ async def _create_with_retry(audio_path: str) -> list[dict]:
                 for w in words
                 if isinstance(w, dict) and w.get("word")
             ]
-        except groq.AuthenticationError as e:
+        except GroqAuthError as e:
             # Don't waste 3 attempts on a bad key.
             raise RuntimeError(
                 f"Groq rejected the API key: {e}. "
                 f"Check GROQ_API_KEY in .env") from e
-        except groq.RateLimitError as e:
+        except GroqRateLimitError as e:
             logger.warning("Groq rate-limited (attempt %d/3): %s", attempt + 1, e)
             if attempt == 2:
                 raise RuntimeError(f"Groq rate limit exceeded after 3 retries: {e}") from e
-            await asyncio.sleep(_retry_delay(attempt, e))
-        except (groq.APIConnectionError, groq.InternalServerError) as e:
+            await asyncio.sleep(_retry_delay(attempt, response))
+        except GroqTransientError as e:
             logger.warning("Groq transient error (attempt %d/3): %s", attempt + 1, e)
             if attempt == 2:
                 raise RuntimeError(f"Groq API error after 3 retries: {e}") from e
-            await asyncio.sleep(_retry_delay(attempt, e))
+            await asyncio.sleep(_retry_delay(attempt, response))
     raise RuntimeError("Groq transcription failed (exhausted retries)")
 
 
-def _retry_delay(attempt: int, exc: Exception) -> float:
+def _retry_delay(attempt: int, response: Any) -> float:
     """Exponential backoff, honoring Retry-After when Groq sends one."""
-    retry_after = getattr(exc, "response", None)
     header = None
     try:
-        header = retry_after.headers.get("retry-after") if retry_after else None
+        header = response.headers.get("retry-after")
     except AttributeError:
         pass
     if header:
@@ -170,7 +219,7 @@ def _retry_delay(attempt: int, exc: Exception) -> float:
 
 async def transcribe_audio(audio_path: str) -> list[dict]:
     """Transcribes one file (≤ 24 MB). Returns [{word, start, end}, ...]."""
-    return await _create_with_retry(audio_path)
+    return await _transcribe_with_retry(audio_path)
 
 
 async def transcribe_chunks(chunks: list[tuple[str, float]],

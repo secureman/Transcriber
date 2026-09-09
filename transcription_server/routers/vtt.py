@@ -22,9 +22,14 @@ async def get_vtt(abs_item_id: str, chapter_index: int):
         raise HTTPException(404, "Chapter not transcribed (never queued)")
 
     if job["status"] == "done":
-        vtt_path = job["vtt_path"] or os.path.join(
-            settings.OUTPUT_DIR, abs_item_id,
-            f"chapter_{chapter_index}.vtt")
+        # The DB may hold a path from the machine that transcribed the
+        # chapter (data dir moved, or DB migrated between hosts, e.g.
+        # PC → Termux). Prefer the stored path when it exists on this host,
+        # otherwise fall back to this install's cache location.
+        vtt_path = job["vtt_path"]
+        if not vtt_path or not os.path.exists(vtt_path):
+            vtt_path = os.path.join(settings.OUTPUT_DIR, abs_item_id,
+                                    f"chapter_{chapter_index}.vtt")
         if not os.path.exists(vtt_path):
             raise HTTPException(500, "VTT file missing")
         return _serve_vtt(vtt_path)
@@ -40,7 +45,13 @@ async def get_vtt(abs_item_id: str, chapter_index: int):
             media_type="application/json",
         )
 
-    # error
+    # error — but the on-disk VTT cache is the source of truth: if a file is
+    # there (e.g. transcribed in an earlier run before the job row got
+    # marked as an error), serve it instead of failing.
+    vtt_path = os.path.join(settings.OUTPUT_DIR, abs_item_id,
+                            f"chapter_{chapter_index}.vtt")
+    if os.path.exists(vtt_path):
+        return _serve_vtt(vtt_path)
     raise HTTPException(500, f"Transcription failed: {job['error_message']}")
 
 
