@@ -23,7 +23,10 @@ class BookCard extends ConsumerWidget {
     final offlineBook = ref.watch(offlineStoreProvider).books[item.id];
     final coverUrl = item.coverUrl(config.absUrl);
     ref.watch(readChaptersProvider); // rebuild badge when listened set changes
-    final chapterCount = item.chapters.length;
+    // `chapterCount` works for minified library items too (sourced from
+    // `media.numChapters`), unlike `chapters.length` which is empty on
+    // the library list endpoint.
+    final chapterCount = item.chapterCount;
     final isBookListened = ref
         .read(readChaptersProvider.notifier)
         .isBookListened(item.id, chapterCount);

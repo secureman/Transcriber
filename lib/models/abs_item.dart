@@ -81,6 +81,14 @@ class AbsItem {
   final double? resumeSeconds;
   final String? narratorName;
 
+  /// Total chapter count, sourced from ABS's `media.numChapters` when
+  /// available — falls back to `chapters.length` otherwise. Minified
+  /// library-list items (see library_provider.dart) never include the
+  /// actual `chapters` array, only this count, so callers that just need
+  /// "how many chapters does this book have" (e.g. the whole-book
+  /// listened toggle) should use this instead of `chapters.length`.
+  final int chapterCount;
+
   const AbsItem({
     required this.id,
     required this.title,
@@ -95,6 +103,7 @@ class AbsItem {
     this.progress = 0,
     this.resumeSeconds,
     this.narratorName,
+    this.chapterCount = 0,
   });
 
   bool get isArabic =>
@@ -182,6 +191,31 @@ class AbsItem {
         progress: progress,
         resumeSeconds: resumeSeconds,
         narratorName: narratorName,
+        chapterCount: chapterCount,
+      );
+
+  /// Merges bulk ABS progress (from `GET /api/me`'s `mediaProgress` array)
+  /// onto this item. Used by the library list, which never returns
+  /// per-user progress on its own — see library_provider.dart, which
+  /// fetches it separately in one shot and merges it in client-side.
+  AbsItem copyWithAbsProgress({
+    required double progressFraction,
+    required double? currentTimeSec,
+  }) => AbsItem(
+        id: id,
+        mediaId: mediaId,
+        title: title,
+        author: author,
+        duration: duration,
+        chapters: chapters,
+        audioFiles: audioFiles,
+        seriesName: seriesName,
+        language: language,
+        coverPath: coverPath,
+        progress: progressFraction,
+        resumeSeconds: currentTimeSec,
+        narratorName: narratorName,
+        chapterCount: chapterCount,
       );
 
   factory AbsItem.fromJson(Map<String, dynamic> json) {
@@ -197,6 +231,15 @@ class AbsItem {
     // query param via req.user.getOldMediaProgress(...).
     final mediaProgress = json['userMediaProgress'] as Map<String, dynamic>?;
     final narrators = metadata['narrators'] as List<dynamic>?;
+    final durationVal = (media['duration'] as num?)?.toDouble() ?? 0;
+    final resumeSecondsVal =
+        (mediaProgress?['currentTime'] as num?)?.toDouble();
+    // `numChapters` is present on both minified and expanded item JSON
+    // (see LibraryItem.toOldJSONMinified in the ABS server source); the
+    // `chapters` array itself is expanded-only, so fall back to its
+    // length for the (rare) case numChapters is missing but the full
+    // array is present.
+    final numChaptersVal = (media['numChapters'] as num?)?.toInt();
 
     String? seriesName;
     if (metadata['seriesName'] is String) {
@@ -211,7 +254,7 @@ class AbsItem {
       mediaId: (media['id'] as String?) ?? '',
       title: (metadata['title'] as String?) ?? (json['name'] as String?) ?? 'Unknown',
       author: (metadata['authorName'] as String?) ?? '',
-      duration: (media['duration'] as num?)?.toDouble() ?? 0,
+      duration: durationVal,
       chapters: chaptersJson
           .map((c) => AbsChapter.fromJson(c as Map<String, dynamic>))
           .toList(),
@@ -222,12 +265,23 @@ class AbsItem {
       language: metadata['language'] as String?,
       coverPath:
           (media['coverPath'] as String?) ?? (json['coverPath'] as String?) ?? '',
-      progress:
-          (media['progress'] as num?)?.toDouble() ?? (json['progress'] as num?)?.toDouble() ?? 0,
-      resumeSeconds: (mediaProgress?['currentTime'] as num?)?.toDouble(),
+      // ABS item JSON has no top-level `progress` field of its own — the
+      // only per-user progress on an item fetch is `userMediaProgress`
+      // (expanded fetches only), so derive the 0..1 fraction from that
+      // instead of reading a key that's never actually populated. Library
+      // list items (minified, no userMediaProgress) come back with 0 here
+      // and get it merged in separately — see copyWithAbsProgress above
+      // and library_provider.dart.
+      progress: mediaProgress?['isFinished'] == true
+          ? 1.0
+          : (resumeSecondsVal != null && durationVal > 0
+              ? (resumeSecondsVal / durationVal).clamp(0.0, 1.0)
+              : 0.0),
+      resumeSeconds: resumeSecondsVal,
       narratorName: (narrators != null && narrators.isNotEmpty)
           ? narrators.first as String?
           : null,
+      chapterCount: numChaptersVal ?? chaptersJson.length,
     );
   }
 
@@ -253,6 +307,7 @@ class AbsItem {
           .toList(),
       audioFiles: const [],
       coverPath: (json['cover_url'] as String?) ?? '',
+      chapterCount: chaptersJson.length,
     );
   }
 

@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/network/abs_client.dart';
+import '../../core/network/abs_sync.dart';
 import '../../core/offline/offline_provider.dart';
+import '../../core/providers/read_chapters_provider.dart';
 import '../../core/providers/shared_prefs_provider.dart';
 import '../../models/abs_item.dart';
 
@@ -95,9 +98,44 @@ class LibraryController extends AsyncNotifier<LibraryState> {
     }
     final results =
         (itemsRes.data['results'] as List<dynamic>? ?? []);
-    final newItems = results
+    var newItems = results
         .map((e) => AbsItem.fromLibraryJson(e as Map<String, dynamic>))
         .toList();
+
+    // The library list endpoint never returns per-user progress, even
+    // minified=0 — merge it in from one bulk `/api/me` fetch instead of
+    // hitting each book's expanded endpoint (see absMediaProgressProvider).
+    // Best-effort: if this fails (offline, slow), items just show no
+    // progress rather than blocking the whole page.
+    try {
+      final progressByItemId = await ref.read(
+        absMediaProgressProvider.future,
+      );
+      if (progressByItemId.isNotEmpty) {
+        newItems = newItems.map((item) {
+          final entry = progressByItemId[item.id];
+          if (entry == null) return item;
+          return item.copyWithAbsProgress(
+            progressFraction: entry.progressFraction,
+            currentTimeSec: entry.currentTime,
+          );
+        }).toList();
+        // Bulk-restore per-chapter "listened" marks for every book the
+        // server already knows about — so a fresh install / relogin shows
+        // correct state across the whole library, not just books the
+        // user happens to open. Fire-and-forget so the library paints
+        // immediately; the listened-state provider rebuilds dependent
+        // widgets (badges) on its own.
+        unawaited(
+          ref
+              .read(readChaptersProvider.notifier)
+              .restoreFromServerBulkProgress(progressByItemId),
+        );
+      }
+    } catch (_) {
+      // Progress is a nice-to-have on this screen — never block the
+      // library list on it.
+    }
 
     final prev = state.valueOrNull ?? const LibraryState();
     final merged = page == 0

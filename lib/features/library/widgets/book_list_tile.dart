@@ -26,7 +26,10 @@ class BookListTile extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     // Rebuild when the listened set changes so the badge stays live.
     ref.watch(readChaptersProvider);
-    final chapterCount = item.chapters.length;
+    // `chapterCount` works for minified library items too (sourced from
+    // `media.numChapters`), unlike `chapters.length` which is empty on
+    // the library list endpoint.
+    final chapterCount = item.chapterCount;
 
     // Speed-adjusted listening time left, ABS-style. Uses the last-used
     // playback speed (the same value the player restores) — there is no

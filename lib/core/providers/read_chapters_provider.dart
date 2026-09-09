@@ -2,9 +2,10 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../models/abs_item.dart';
 import '../../features/player/player_state.dart' show bookMetaProvider;
+import '../../models/abs_item.dart';
 import '../network/abs_client.dart';
+import '../network/abs_sync.dart';
 import 'config_provider.dart';
 import 'playback_progress_provider.dart';
 import 'shared_prefs_provider.dart';
@@ -17,10 +18,10 @@ import 'shared_prefs_provider.dart';
 /// restart.
 const kReadChaptersKey = 'read_chapters_index';
 
-/// In-flight mark→ABS pushes, keyed `"itemId/chapterIndex"` (and
-/// `"itemId/-1"` for whole-book toggles). Prevents stacking duplicate
-/// requests when the user taps quickly and gives [pendingAbsPushesProvider]
-/// something to count.
+/// In-flight mark→ABS pushes, keyed `"itemId/chapterIndex"` for listened
+/// marks, `"itemId/chapterIndex"` (with a `pos:` prefix) for position-only
+/// pushes. Prevents stacking duplicate requests when the user taps quickly
+/// and gives [pendingAbsPushesProvider] something to count.
 final _absPushInFlight = <String>{};
 
 /// Number of chapter-mark pushes currently being sent to Audiobookshelf.
@@ -28,6 +29,7 @@ final _absPushInFlight = <String>{};
 /// without revealing whether any individual chapter is marked.
 final pendingAbsPushesProvider = Provider<int>((ref) {
   ref.watch(readChaptersProvider);
+  ref.watch(chapterPositionsProvider);
   return _absPushInFlight.length;
 });
 
@@ -52,8 +54,12 @@ class ReadChaptersController extends Notifier<Set<String>> {
   // `extraData` JSON. So chapter marks are bridged to ABS as book-level
   // writes, the same way any other client would express them:
   //  * markListened      → extraData.absListenChapters += i,
-  //                        currentTime = end of that chapter
-  //  * unmarkListened    → extraData.absListenChapters -= i, isFinished=false
+  //                        currentTime = end of that chapter,
+  //                        extraData.absChapterProgress[i] = chapter.end
+  //  * unmarkListened    → extraData.absListenChapters -= i,
+  //                        isFinished=false (position preserved)
+  //  * recordChapterPosition → extraData.absChapterProgress[i] = pos
+  //                            (called by the player on pause / seek)
   //  * toggleBookListened(all) → full set sync (see _pushBookMark)
   // The server's chapter times come from the cached book metadata
   // (bookMetaProvider, shared with the player UI) — no extra fetches.
@@ -74,7 +80,9 @@ class ReadChaptersController extends Notifier<Set<String>> {
 
   /// Merges [deltaMarks] (+1 to add / −1 to remove) into the ABS media
   /// progress extraData set, moving the server's currentTime to the end of
-  /// the affected chapter when appropriate.
+  /// the affected chapter when appropriate. Also pins the position of the
+  /// affected chapter in `absChapterProgress` so a fresh install can
+  /// resume within the chapter, not just at its end.
   Future<void> _pushChapterMark(
     String itemId,
     int chapterIndex, {
@@ -109,14 +117,29 @@ class ReadChaptersController extends Notifier<Set<String>> {
             .fold<double>(0, (a, b) => b > a ? b : a);
       }
 
+      final extra = await _absExistingExtraData(abs, itemId) ?? const {};
+      final progressJson = <String, dynamic>{
+        if (extra['absChapterProgress'] is Map)
+          ...Map<String, dynamic>.from(
+            extra['absChapterProgress'] as Map,
+          ),
+      };
+      // Pin the position of the affected chapter to its end on mark, or
+      // leave it alone on unmark (the player may have written a partial
+      // position since).
+      if (deltaMarks > 0) {
+        progressJson[chapterIndex.toString()] = chapters[chapterIndex].end;
+      }
+
       await abs.patch(
         '/api/me/progress/$itemId',
         data: {
           'isFinished': false,
           if (currentTimeSec != null) 'currentTime': currentTimeSec.round(),
           'extraData': {
-            ...?await _absExistingExtraData(abs, itemId),
+            ...extra,
             'absListenChapters': set.toList()..sort(),
+            'absChapterProgress': progressJson,
           },
         },
       );
@@ -131,7 +154,9 @@ class ReadChaptersController extends Notifier<Set<String>> {
 
   /// Applies a whole-book mark/unmark: replaces the ABS chapter set with
   /// [listened] (every index when marking, empty when unmarking) and points
-  /// currentTime at the furthest marked chapter's end.
+  /// currentTime at the furthest marked chapter's end. Also pins each
+  /// marked chapter's position to its end so a fresh install can resume
+  /// at the right spot within each chapter.
   Future<void> _pushBookMark(String itemId, Set<int> listened) async {
     const k = '__book__';
     if (!_absPushInFlight.add(k)) return;
@@ -150,19 +175,84 @@ class ReadChaptersController extends Notifier<Set<String>> {
                 .map((i) => chapters[i].end)
                 .fold<double>(0, (a, b) => b > a ? b : a);
 
+      final extra = await _absExistingExtraData(abs, itemId) ?? const {};
+      final progressJson = <String, dynamic>{
+        if (extra['absChapterProgress'] is Map)
+          ...Map<String, dynamic>.from(
+            extra['absChapterProgress'] as Map,
+          ),
+      };
+      for (final i in listened) {
+        if (i < 0 || i >= chapters.length) continue;
+        progressJson[i.toString()] = chapters[i].end;
+      }
+
       await abs.patch(
         '/api/me/progress/$itemId',
         data: {
           'isFinished': false,
           'currentTime': furthest.round(),
           'extraData': {
-            ...?await _absExistingExtraData(abs, itemId),
+            ...extra,
             'absListenChapters': listened.toList()..sort(),
+            'absChapterProgress': progressJson,
           },
         },
       );
     } catch (_) {
       // See _pushChapterMark — local-first, failures are non-fatal.
+    } finally {
+      _absPushInFlight.remove(k);
+      _bumpPending();
+    }
+  }
+
+  /// Pushes a single chapter's playback position (seconds into the
+  /// chapter) to ABS, without touching the listened flag. Called by the
+  /// player as the user listens — preserves "where in the chapter" so a
+  /// fresh install can resume at the right offset, not just at the
+  /// chapter boundary.
+  Future<void> _pushChapterPosition(
+    String itemId,
+    int chapterIndex,
+    double positionSec,
+  ) async {
+    if (positionSec <= 0) return;
+    final k = 'pos:${_key(itemId, chapterIndex)}';
+    if (!_absPushInFlight.add(k)) return; // dedupe rapid position updates
+    _bumpPending();
+    try {
+      final abs = _abs;
+      if (abs == null) return;
+      final meta = await ref.read(bookMetaProvider(itemId).future);
+      final chapters = meta?.chapters ?? const <AbsChapter>[];
+      if (chapterIndex < 0 || chapterIndex >= chapters.length) return;
+      // Clamp to the chapter end so a buggy client can't push past the
+      // chapter boundary and confuse the next /api/me read.
+      final cap = chapters[chapterIndex].end;
+      final clamped = positionSec > cap ? cap : positionSec;
+
+      final extra = await _absExistingExtraData(abs, itemId) ?? const {};
+      final progressJson = <String, dynamic>{
+        if (extra['absChapterProgress'] is Map)
+          ...Map<String, dynamic>.from(
+            extra['absChapterProgress'] as Map,
+          ),
+        chapterIndex.toString(): clamped,
+      };
+
+      await abs.patch(
+        '/api/me/progress/$itemId',
+        data: {
+          'extraData': {
+            ...extra,
+            'absChapterProgress': progressJson,
+          },
+        },
+      );
+    } catch (_) {
+      // Silent — local state already updated; ABS will catch up on the
+      // next successful sync.
     } finally {
       _absPushInFlight.remove(k);
       _bumpPending();
@@ -280,6 +370,23 @@ class ReadChaptersController extends Notifier<Set<String>> {
     unawaited(_pushBookMark(itemId, makeListened ? bookSet : <int>{}));
   }
 
+  /// Records the user's current playback position within [chapterIndex]
+  /// of [itemId] (seconds since the start of that chapter). Updates the
+  /// local position cache immediately (so the player can show / restore
+  /// it on app restart) and mirrors the value to ABS in the background
+  /// so a fresh install / new device can resume at the same offset.
+  Future<void> recordChapterPosition(
+    String itemId,
+    int chapterIndex,
+    double positionSec,
+  ) async {
+    if (positionSec <= 0) return;
+    await ref
+        .read(chapterPositionsProvider.notifier)
+        .recordLocal(itemId, chapterIndex, positionSec);
+    unawaited(_pushChapterPosition(itemId, chapterIndex, positionSec));
+  }
+
   Future<void> _persist(Set<String> next) => ref
       .read(sharedPrefsProvider)
       .setStringList(kReadChaptersKey, next.toList());
@@ -303,6 +410,69 @@ class ReadChaptersController extends Notifier<Set<String>> {
     final p = savedProgress(itemId);
     if (p == null) return null;
     return (chapterIndex: p.chapterIndex, positionSeconds: p.positionSeconds);
+  }
+
+  /// Bulk-restores the per-chapter "listened" set and the per-chapter
+  /// playback positions from the server's MediaProgress records (sourced
+  /// from `GET /api/me`'s `mediaProgress` array — see
+  /// [absMediaProgressProvider]). Listened marks come from
+  /// `extraData.absListenChapters`; positions from
+  /// `extraData.absChapterProgress`. Re-applying them locally brings the
+  /// in-app badges AND the per-chapter resume offsets in sync with
+  /// server state — no per-book detail screen visit required.
+  ///
+  /// Only touches books that have NO local entries yet, so it never
+  /// clobbers in-session toggles or the finer-grained
+  /// [restoreFromServerProgress] that fires when a book's detail screen
+  /// (with real chapter boundaries) is opened.
+  Future<void> restoreFromServerBulkProgress(
+    Map<String, AbsMediaProgressEntry> progressByItemId,
+  ) async {
+    if (progressByItemId.isEmpty) return;
+
+    final listenedAdditions = <String>{};
+    final positionAdditions = <String, double>{};
+    final localPositions = ref.read(chapterPositionsProvider);
+
+    for (final entry in progressByItemId.values) {
+      if (entry.libraryItemId.isEmpty) continue;
+
+      final hasLocalListened =
+          state.any((k) => k.startsWith('${entry.libraryItemId}/'));
+      final hasLocalPosition = localPositions.keys
+          .any((k) => k.startsWith('${entry.libraryItemId}/'));
+
+      // Restore listened marks only if the user has no local chapter
+      // state for this book yet.
+      if (!hasLocalListened && entry.absListenChapters.isNotEmpty) {
+        for (final i in entry.absListenChapters) {
+          if (i < 0) continue;
+          listenedAdditions.add(_key(entry.libraryItemId, i));
+        }
+      }
+
+      // Restore positions only if the user has no local positions for
+      // this book yet — same "don't clobber in-session work" guard.
+      if (!hasLocalPosition && entry.chapterProgress.isNotEmpty) {
+        for (final e in entry.chapterProgress.entries) {
+          if (e.key < 0) continue;
+          final pos = e.value;
+          if (pos < 0) continue;
+          positionAdditions[_key(entry.libraryItemId, e.key)] = pos;
+        }
+      }
+    }
+
+    if (listenedAdditions.isNotEmpty) {
+      final next = {...state, ...listenedAdditions};
+      state = next;
+      await _persist(next);
+    }
+    if (positionAdditions.isNotEmpty) {
+      await ref
+          .read(chapterPositionsProvider.notifier)
+          .mergeFromServer(positionAdditions);
+    }
   }
 
   /// Rebuilds the listened set for [itemId] from the server's resume position,
@@ -347,4 +517,87 @@ class ReadChaptersController extends Notifier<Set<String>> {
 final readChaptersProvider =
     NotifierProvider<ReadChaptersController, Set<String>>(
       ReadChaptersController.new,
+    );
+
+// ── Per-chapter playback positions ────────────────────────────────────
+//
+// Separate from the listened-marks set above: positions are dense
+// (every chapter the player touched, not just completed ones) and live
+// alongside — not inside — the listened flag. The state is a Map keyed
+// by `"<itemId>/<chapterIndex>"` mapping to seconds-since-chapter-start.
+
+const _kChapterPositionsKey = 'chapter_positions';
+
+class ChapterPositionsController extends Notifier<Map<String, double>> {
+  static String _key(String itemId, int chapterIndex) =>
+      '$itemId/$chapterIndex';
+
+  @override
+  Map<String, double> build() {
+    final prefs = ref.watch(sharedPrefsProvider);
+    final stored = prefs.getStringList(_kChapterPositionsKey) ?? const [];
+    final out = <String, double>{};
+    for (final s in stored) {
+      // Serialized as "itemId/chapterIndex|position" so the slash inside
+      // the key never collides with the pipe separator.
+      final sep = s.lastIndexOf('|');
+      if (sep <= 0) continue;
+      final k = s.substring(0, sep);
+      final v = double.tryParse(s.substring(sep + 1));
+      if (v == null || v < 0) continue;
+      out[k] = v;
+    }
+    return out;
+  }
+
+  /// Returns the saved position for [chapterIndex] of [itemId], or null
+  /// when the user has never played (or never saved a position in) that
+  /// chapter on this device.
+  double? get(String itemId, int chapterIndex) =>
+      state[_key(itemId, chapterIndex)];
+
+  /// Local-only write. Caller is responsible for also mirroring to ABS
+  /// (see `ReadChaptersController.recordChapterPosition`).
+  Future<void> recordLocal(
+    String itemId,
+    int chapterIndex,
+    double positionSec,
+  ) async {
+    if (positionSec <= 0) return;
+    final k = _key(itemId, chapterIndex);
+    final current = state[k];
+    if (current != null && (current - positionSec).abs() < 0.5) return;
+    final next = {...state, k: positionSec};
+    state = next;
+    await _persist(next);
+  }
+
+  /// Bulk merge from server-restore — only writes keys that don't exist
+  /// locally yet, so an in-session position (e.g. the user has been
+  /// listening for 10 minutes since the restore ran) is never clobbered.
+  Future<void> mergeFromServer(Map<String, double> additions) async {
+    if (additions.isEmpty) return;
+    final next = {...state};
+    var changed = false;
+    for (final e in additions.entries) {
+      if (next.containsKey(e.key)) continue;
+      next[e.key] = e.value;
+      changed = true;
+    }
+    if (!changed) return;
+    state = next;
+    await _persist(next);
+  }
+
+  Future<void> _persist(Map<String, double> next) => ref
+      .read(sharedPrefsProvider)
+      .setStringList(
+        _kChapterPositionsKey,
+        next.entries.map((e) => '${e.key}|${e.value}').toList(),
+      );
+}
+
+final chapterPositionsProvider =
+    NotifierProvider<ChapterPositionsController, Map<String, double>>(
+      ChapterPositionsController.new,
     );
