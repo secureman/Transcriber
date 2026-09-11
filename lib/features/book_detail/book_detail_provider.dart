@@ -117,7 +117,7 @@ final chapterStatusProvider =
     // watch() so a config change (added/removed backend URL) re-evaluates
     // this stream — otherwise the user could edit the URL in settings
     // and the polling would still see the old "no backend" branch.
-    if (!ref.watch(configProvider).backendConfigured) {
+    if (!ref.watch(configProvider).serverConfigured) {
       yield const {};
       return;
     }
@@ -178,7 +178,7 @@ class ActiveJob {
 /// the user navigates away (auto-dispose).
 final activeJobsProvider =
     StreamProvider.autoDispose<List<ActiveJob>>((ref) async* {
-  if (!ref.read(configProvider).backendConfigured) {
+  if (!ref.read(configProvider).serverConfigured) {
     yield const [];
     return;
   }
@@ -331,7 +331,7 @@ class TranscribeController extends Notifier<TranscribeState> {
     required int chapterIndex,
     required int totalChapters,
   }) async {
-    if (!ref.read(configProvider).backendConfigured) {
+    if (!ref.read(configProvider).serverConfigured) {
       state = const TranscribeState(
           error: 'No transcription server configured');
       return false;

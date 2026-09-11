@@ -6,8 +6,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:just_audio/just_audio.dart' hide PlayerState;
 
 import '../../core/network/abs_client.dart';
-import '../../core/network/abs_sync.dart';
 import '../../core/network/backend_client.dart';
+import '../../core/network/progress_sync.dart';
 import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
 import '../../core/providers/playback_progress_provider.dart';
@@ -22,12 +22,28 @@ import 'player_state.dart';
 class PlayerController extends Notifier<PlayerState> {
   Timer? _vttPollTimer;
   Timer? _sleepTimer;
+  // One-shot 45s VTT retry: armed when a chapter has no transcript AND no
+  // cached copy because the backend was unreachable (transcription jobs
+  // keep running server-side, so the VTT can simply appear later). Canceled
+  // by any successful VTT apply, chapter switch, or dispose.
+  Timer? _vttRetryTimer;
   StreamSubscription<Duration>? _positionSub;
   StreamSubscription<ProcessingState>? _processingSub;
   // BUG FIX v1: track playing state so play/pause button reflects reality.
   StreamSubscription<bool>? _playingSub;
+  // Auto-advance detection: just_audio 0.10's setAudioSources playlist
+  // emits 1 when the current source ends and the queue advances to the
+  // prefetched next. Listening for that lets us replace the old
+  // processingState.completed chapter-end hook (which the playlist no
+  // longer fires mid-playlist).
+  StreamSubscription<int?>? _currentIndexSub;
   int _lastEmitMs = 0;
   int _loadedChapterIndex = -1;
+
+  // Full item kept around so the auto-advance path can rebuild the
+  // queue (compute next-chapter sources) without re-fetching the item
+  // from ABS on every chapter boundary.
+  AbsItem? _loadedItem;
 
   // ── ABS progress sync ─────────────────────────────────────────────
   String? _syncItemId;
@@ -77,6 +93,7 @@ class PlayerController extends Notifier<PlayerState> {
 
   void _cleanup() {
     _vttPollTimer?.cancel();
+    _vttRetryTimer?.cancel();
     _sleepTimer?.cancel();
     _positionSub?.cancel();
     _processingSub?.cancel();
@@ -100,9 +117,10 @@ class PlayerController extends Notifier<PlayerState> {
     _positionSub?.cancel();
     _processingSub?.cancel();
     _playingSub?.cancel();
+    _currentIndexSub?.cancel();
     _loadedChapterIndex = chapterIndex;
 
-    // Fresh ABS sync context for this book.
+    // Fresh progress-sync context for this book.
     _syncItemId = itemId;
     _syncBookDuration = 0;
     _syncChapterStart = 0;
@@ -167,6 +185,9 @@ class PlayerController extends Notifier<PlayerState> {
       }
       item = AbsItem.fromJson(res.data as Map<String, dynamic>);
     }
+    // Keep the full item so the auto-advance path can rebuild the
+    // queue (compute next-chapter sources) without an extra ABS fetch.
+    _loadedItem = item;
 
     final isArabic =
         item.isArabic ||
@@ -182,46 +203,34 @@ class PlayerController extends Notifier<PlayerState> {
 
     // Resume to the exact second, not just the top of the chapter.
     //
-    // Previously this always seeked to chapter.start, even though the
-    // exact position was being faithfully pushed to ABS the whole time via
-    // _syncProgress() — a write-only relationship with the server. ABS's
-    // userMediaProgress.currentTime (only present when fetched with
-    // ?expanded=1, see AbsItem.fromJson) is the live, cross-device source
-    // of truth for "where did the user actually stop". We only apply it
-    // when it falls inside the chapter we're about to load — if it
-    // doesn't, this is ordinary chapter navigation (next/prev/tapped a
-    // different chapter), not a resume, and it should start at the top
-    // like before. Because the exact-second position is synced to ABS
-    // continuously as the book is played, a stale/previous chapter's
-    // progress value naturally won't fall in an unrelated chapter's
-    // range, so this check doesn't need any extra "is this the first
-    // load of the session" bookkeeping to stay correct.
+    // The metadata server owns the resumption position: after login its bulk
+    // fetch populates the local playback-progress store, and the player
+    // keeps that store fresh continuously. So prefer the local bookmark —
+    // it's per-chapter exact. Fall back to the ABS `userMediaProgress`
+    // position the item fetch happens to carry (legacy data ABS may still
+    // hold from before the app moved progress to its own server), and
+    // finally start at the chapter top for ordinary chapter navigation.
     final resumeTarget = item.resumeSeconds;
+    final localProgress = BookPlaybackProgress.fromPrefs(
+      ref.read(sharedPrefsProvider),
+      itemId,
+    );
     double seekSeconds;
-    if (resumeTarget != null &&
+    if (localProgress != null &&
+        localProgress.chapterIndex == chIndex &&
+        localProgress.positionSeconds > 0 &&
+        localProgress.positionSeconds < chapter.duration) {
+      // Metadata-server-derived bookmark — the source of truth.
+      seekSeconds = chapter.start + localProgress.positionSeconds;
+    } else if (resumeTarget != null &&
         resumeTarget >= chapter.start &&
         resumeTarget < chapter.end) {
-      // ABS is the freshest cross-device source of truth — prefer it.
+      // Legacy ABS resume point — only when there is no local bookmark.
       seekSeconds = resumeTarget;
     } else {
-      // No usable ABS resume point (fresh book, sync disabled/stale after
-      // a failed write, server unreachable) — fall back to this app's
-      // locally persisted position, but only when it belongs to the chapter
-      // we're actually loading. If it belongs to a different chapter (user
-      // tapped a chapter from the list), start at that chapter's top as
-      // usual.
-      final localProgress = BookPlaybackProgress.fromPrefs(
-        ref.read(sharedPrefsProvider),
-        itemId,
-      );
-      if (localProgress != null &&
-          localProgress.chapterIndex == chIndex &&
-          localProgress.positionSeconds > 0 &&
-          localProgress.positionSeconds < chapter.duration) {
-        seekSeconds = chapter.start + localProgress.positionSeconds;
-      } else {
-        seekSeconds = chapter.start;
-      }
+      // No usable resume point (fresh book, ordinary navigation —
+      // next/prev/tapped a different chapter), start at the chapter top.
+      seekSeconds = chapter.start;
     }
     // How far into the chapter we're resuming — 0 for an ordinary (non-resume)
     // chapter load. Needed below to keep the file's end-boundary anchored to
@@ -246,7 +255,36 @@ class PlayerController extends Notifier<PlayerState> {
     final artist = item.author.isEmpty ? null : item.author;
     final chapterNumber = chIndex + 1;
 
-    // Record everything the ABS progress syncer needs for this book so it can
+    // ── Next-chapter prefetch ────────────────────────────────────────
+    // Compute the next chapter's clip bounds so the player can queue it
+    // alongside the current one. just_audio 0.10's setAudioSources (with
+    // useLazyPreparation, the default) fetches and buffers source[1] in
+    // the background while source[0] plays — so the inter-chapter
+    // transition is gapless. We skip the prefetch when the next chapter
+    // spans multiple audio files (it can't be expressed as a single
+    // ClippingAudioSource).
+    String? nextFileIno;
+    double? nextStartSec;
+    double? nextEndSec;
+    String? nextFilePath;
+    if (chIndex + 1 < item.chapters.length) {
+      final nextChapter = item.chapters[chIndex + 1];
+      final (nIno, nStartOffset) = AudiobookAudioHandler.resolveFilePosition(
+        files: files,
+        seconds: nextChapter.start,
+      );
+      final (nEndIno, nEndOffset) = AudiobookAudioHandler.resolveFilePosition(
+        files: files,
+        seconds: nextChapter.end,
+      );
+      if (nIno.isNotEmpty && nEndIno == nIno) {
+        nextFileIno = nIno;
+        nextStartSec = nStartOffset;
+        nextEndSec = nEndOffset;
+      }
+    }
+
+    // Record everything the progress syncer needs for this book so it can
     // report a position on the whole-book timeline.
     _syncBookDuration = item.duration;
     _syncChapterStart = chapter.start;
@@ -275,6 +313,29 @@ class PlayerController extends Notifier<PlayerState> {
           throw Exception('Local audio file missing: $filePath');
         }
       }
+
+      // For offline playback, only attach the next chapter's prefetch
+      // when the file is already on disk too — otherwise the queued
+      // source would fail to open. If it's missing we just fall back to
+      // a single-item playlist (no prefetch), same as before this change.
+      if (nextFileIno != null) {
+        final nextAudioFile = item.audioFiles.firstWhere(
+          (f) => f.ino == nextFileIno,
+          orElse: () => const AbsAudioFile(ino: '', duration: 0, filename: ''),
+        );
+        if (nextAudioFile.ino.isNotEmpty) {
+          final candidate = '${offlineBook.dirPath}/${nextAudioFile.offlineFilename}';
+          if (await File(candidate).exists()) {
+            nextFilePath = candidate;
+          }
+        }
+      }
+      if (nextFilePath == null) {
+        nextFileIno = null;
+        nextStartSec = null;
+        nextEndSec = null;
+      }
+
       await handler.loadChapterFromFile(
         filePath: filePath,
         startSec: offsetInFile,
@@ -283,6 +344,9 @@ class PlayerController extends Notifier<PlayerState> {
         artist: artist,
         chapterNumber: chapterNumber,
         totalChapters: totalChapters,
+        nextFilePath: nextFilePath,
+        nextStartSec: nextStartSec,
+        nextEndSec: nextEndSec,
       );
     } else {
       await handler.loadChapter(
@@ -296,6 +360,9 @@ class PlayerController extends Notifier<PlayerState> {
         artist: artist,
         chapterNumber: chapterNumber,
         totalChapters: totalChapters,
+        nextFileIno: nextFileIno,
+        nextStartSec: nextStartSec,
+        nextEndSec: nextEndSec,
       );
     }
 
@@ -310,15 +377,31 @@ class PlayerController extends Notifier<PlayerState> {
       bookDurationSeconds: item.duration,
     );
 
+    // Two listeners cooperate to detect "chapter ended":
+    //
+    //  * currentIndexStream — fires `1` when the playlist auto-advances
+    //    from index 0 (current) to index 1 (prefetched next). This is the
+    //    common case: the current chapter ended and we need to rebuild
+    //    the queue with [next, nextNext] so the prefetch keeps rolling.
+    //  * processingStateStream — fires `completed` when the playlist
+    //    exhausts its items (i.e. we're on the last chapter and the
+    //    single source reached its end). Handles the "book finished"
+    //    path.
+    _currentIndexSub = handler.player.currentIndexStream.listen((idx) {
+      if (idx == 1 && state.audioReady) _onChapterEnd(advanced: true);
+    });
     _processingSub = handler.player.processingStateStream.listen((ps) {
-      if (ps == ProcessingState.completed) _onChapterEnd();
+      // The playlist rebuild sets processingState to loading/ready as it
+      // swaps sources — those events must not be mistaken for chapter end.
+      if (_advancingPlaylist) return;
+      if (ps == ProcessingState.completed) _onChapterEnd(advanced: false);
     });
   }
 
   // ── VTT loading with offline cache ────────────────────────────────
 
   Future<void> _loadVtt(String itemId, int chapterIndex) async {
-    if (!ref.read(configProvider).backendConfigured) {
+    if (!ref.read(configProvider).serverConfigured) {
       // No backend — try cache before giving up.
       final cached = _readCache(itemId, chapterIndex);
       if (cached != null) {
@@ -369,11 +452,30 @@ class PlayerController extends Notifier<PlayerState> {
       }
     } catch (_) {
       // Network error (server offline / unreachable) — fall back to cache.
+      // With no cache, don't give up permanently: transcription keeps
+      // running server-side, so re-check once after a delay. The retry is
+      // one-shot and canceled by a chapter switch / dispose / a concurrent
+      // success, and re-arms itself only while the backend stays down.
+      _vttRetryTimer?.cancel();
       final cached = _readCache(itemId, chapterIndex);
       if (cached != null) {
         _applyVtt(cached, fromCache: true);
       } else {
         state = state.copyWith(vttStatus: VttStatus.notFound);
+        _vttRetryTimer = Timer(const Duration(seconds: 45), () {
+          // Stale guard: the user may have switched chapters meanwhile.
+          if (state.itemId != itemId || state.chapterIndex != chapterIndex) {
+            return;
+          }
+          if (state.hasVtt || state.vttStatus == VttStatus.transcribing) {
+            return;
+          }
+          unawaited(_loadVtt(itemId, chapterIndex).then((_) {
+            // Successful apply (or another arm in _loadVtt's catch) has
+            // already run — nothing to do here; the future just keeps
+            // unhandled errors from surfacing.
+          }));
+        });
       }
     }
   }
@@ -415,6 +517,8 @@ class PlayerController extends Notifier<PlayerState> {
   }
 
   void _applyVtt(String vttContent, {required bool fromCache}) {
+    // A transcript landed — any pending retry is obsolete.
+    _vttRetryTimer?.cancel();
     final cues = VttParser.parse(vttContent);
     if (cues.isEmpty) {
       state = state.copyWith(
@@ -516,15 +620,15 @@ class PlayerController extends Notifier<PlayerState> {
   }
 
   /// Best-effort final flush used on app backgrounding / dispose: writes the
-  /// local store AND re-arms + fires the ABS sync so the server gets the
-  /// freshest position too (when reachable).
+  /// local store AND re-arms + fires the progress sync so the server gets
+  /// the freshest position too (when reachable).
   Future<void> flushProgress() async {
     _saveLocalProgress();
     _lastSyncMs = 0;
     _syncProgress();
   }
 
-  // ── ABS progress sync ──────────────────────────────────────────────
+  // ── Progress-server sync ────────────────────────────────────────────
 
   /// Throttled rolling sync — fires at most once per `_backoffSeconds()` while
   /// playing so we don't hammer the server, but still keeps ABS up to date.
@@ -547,7 +651,7 @@ class PlayerController extends Notifier<PlayerState> {
     return exp.clamp(10, 300);
   }
 
-  /// Reports the current book-timeline position to Audiobookshelf.
+  /// Reports the current book-timeline position to the metadata server.
   void _syncProgress({bool isFinished = false}) {
     final itemId = _syncItemId;
     if (itemId == null) return;
@@ -556,24 +660,19 @@ class PlayerController extends Notifier<PlayerState> {
 
     // Player position is inside the chapter clip; chapter.start is the
     // chapter's offset on the whole-book timeline.
+    final positionSec = _lastPosition.inMilliseconds / 1000.0;
     final currentTime =
-        (_syncChapterStart + _lastPosition.inMilliseconds / 1000.0).clamp(
-          0.0,
-          duration,
-        );
+        (_syncChapterStart + positionSec).clamp(0.0, duration);
+    final chapterIndex = state.chapterIndex;
 
     unawaited(
       ref
           .read(progressSyncProvider)
-          .reportProgress(
+          .bookProgress(
             itemId: itemId,
-            durationSec: duration,
-            currentTimeSec: currentTime,
-            isFinished: isFinished,
-            startedAt: _syncStartedAt,
-            finishedAt: isFinished
-                ? DateTime.now().millisecondsSinceEpoch
-                : null,
+            chapterIndex: chapterIndex,
+            positionSec: positionSec,
+            progressFraction: (currentTime / duration).clamp(0.0, 1.0),
           )
           .then((accepted) {
             if (accepted) {
@@ -587,6 +686,27 @@ class PlayerController extends Notifier<PlayerState> {
             _lastSyncMs = DateTime.now().millisecondsSinceEpoch;
           }),
     );
+
+    // Whole-book finished flag — fires on book completion so the server
+    // (and therefore other devices after their login restore) sees it.
+    if (isFinished) {
+      unawaited(
+        ref.read(progressSyncProvider).bookFinished(itemId, true),
+      );
+    }
+
+    // Mirror the within-chapter position to the progress server too — the
+    // whole-book bookmark alone only resumes at the chapter boundary on a
+    // fresh install. Locally dedup'd (>0.5s change) and in-flight-dedup'd
+    // inside the provider, so it's safe to fire from every sync tick
+    // (throttled play ticks + immediate pause/seek/chapter-change).
+    if (positionSec > 0 && chapterIndex >= 0) {
+      unawaited(
+        ref
+            .read(readChaptersProvider.notifier)
+            .recordChapterPosition(itemId, chapterIndex, positionSec),
+      );
+    }
   }
 
   // ── Playback controls ──────────────────────────────────────────────
@@ -595,8 +715,8 @@ class PlayerController extends Notifier<PlayerState> {
     final handler = ref.read(audioHandlerProvider);
     if (handler.player.playing) {
       await handler.pause();
-      // Flush progress immediately on pause so ABS and the local store both
-      // see where we stopped.
+      // Flush progress immediately on pause so the progress server and the
+      // local store both see where we stopped.
       _saveLocalProgress();
       _lastSyncMs = 0;
       _syncProgress();
@@ -678,8 +798,35 @@ class PlayerController extends Notifier<PlayerState> {
   Future<void> switchChapter(int newIndex) async {
     final itemId = state.itemId;
     if (itemId == null) return;
+    final old = state;
+    // Skip-in-circles protection: clamped in prev/next below.
+    final clamped = newIndex.clamp(0, old.totalChapters - 1);
+    if (clamped != newIndex) return;
+    // A chapter switch makes the pending VTT retry (and any transcribe
+    // polling) obsolete — the new chapter loads its own.
+    _vttRetryTimer?.cancel();
+    // Mark the departed chapter as listened so the read-along "read so far"
+    // stays truthful about skipping around:
+    //  * jumping FORWARD past a chapter = you chose not to hear it,
+    //  * jumping BACKWARD = you "un-hear" the tail of the book only if you
+    //    had actually played most of it (>= 90%) — otherwise the mark would
+    //    instantly defeat a half-heard chapter's badge.
+    final meta = ref.read(bookMetaProvider(itemId)).valueOrNull;
+    if (meta != null && meta.chapters.isNotEmpty) {
+      final notifier = ref.read(readChaptersProvider.notifier);
+      if (clamped > old.chapterIndex) {
+        for (var i = old.chapterIndex; i < clamped; i++) {
+          notifier.markListened(itemId, i);
+        }
+      } else if (clamped < old.chapterIndex &&
+          old.chapterDuration > Duration.zero &&
+          old.position.inMilliseconds >=
+              old.chapterDuration.inMilliseconds * 0.9) {
+        notifier.markListened(itemId, old.chapterIndex);
+      }
+    }
     // Persist where the previous chapter left off, both locally and (when
-    // reachable) to ABS.
+    // reachable) on the progress server.
     _saveLocalProgress();
     _lastSyncMs = 0;
     _syncProgress();
@@ -687,7 +834,7 @@ class PlayerController extends Notifier<PlayerState> {
     _progressTimer?.cancel();
     state = const PlayerState();
     _loadedChapterIndex = -1;
-    await init(itemId, newIndex);
+    await init(itemId, clamped);
     await ref.read(audioHandlerProvider).play();
   }
 
@@ -696,11 +843,24 @@ class PlayerController extends Notifier<PlayerState> {
     await switchChapter(0);
   }
 
-  Future<void> nextChapter() => switchChapter(state.chapterIndex + 1);
-  Future<void> prevChapter() => switchChapter(state.chapterIndex - 1);
+  /// Next chapter. No-op on the last chapter (the row's next button can't
+  /// wrap into a "start over" accident).
+  Future<void> nextChapter() {
+    if (state.isOnLastChapter) return Future.value();
+    return switchChapter(state.chapterIndex + 1);
+  }
 
-  void _onChapterEnd() {
-    // Persist the "listened" flag for this chapter.
+  /// Previous chapter: rewind to the top of the current one, one chapter
+  /// per press from there — the classic podcast-app behaviour.
+  Future<void> prevChapter() {
+    if (state.chapterIndex <= 0) {
+      return seekTo(Duration.zero);
+    }
+    return switchChapter(state.chapterIndex - 1);
+  }
+
+  void _onChapterEnd({required bool advanced}) {
+    // Mark the chapter that just finished.
     final itemId = state.itemId;
     if (itemId != null) {
       ref
@@ -715,12 +875,177 @@ class PlayerController extends Notifier<PlayerState> {
       return;
     }
     if (state.isOnLastChapter) {
-      // Mark the whole book as finished in ABS too.
+      // Mark the whole book as finished on the progress server too. `advanced == false`
+      // here means the playlist exhausted (single source, last chapter);
+      // `advanced == true` would be unusual at this point because we
+      // never queue a "next" past the last chapter, but guard anyway.
       _syncProgress(isFinished: true);
       state = state.copyWith(playing: false, finished: true);
       return;
     }
-    if (state.audioReady) nextChapter();
+    if (!advanced) return; // single-item playlist ended cleanly; nothing to do
+    if (state.audioReady) {
+      // Auto-advanced into the prefetched next chapter. Rebuild the
+      // queue so the now-current chapter sits at index 0 with its own
+      // prefetch (nextNext) at index 1 — the prefetch chain keeps rolling.
+      //
+      // CRITICAL: this is running inside a player stream listener. Calling
+      // setAudioSources() synchronously from within that listener deadlocks
+      // just_audio's event pump (the load waits for events that can't be
+      // delivered until the listener returns) — the app freezes and then
+      // dies. Defer the rebuild to the next event-loop turn. A reentrancy
+      // guard additionally collapses duplicate end-of-chapter events
+      // (idx==1 firing again, or `completed` during the rebuild) into a
+      // single rebuild — two concurrent setAudioSources calls crash.
+      _advancingPlaylist = true;
+      Timer.run(() async {
+        try {
+          await _advancePlaylist();
+        } finally {
+          _advancingPlaylist = false;
+        }
+      });
+    }
+  }
+
+  /// True while the end-of-chapter playlist rebuild is queued/in flight.
+  /// Collapses the burst of end-of-chapter events (currentIndexStream's
+  /// idx==1 plus processingStateStream's `completed`, plus any events the
+  /// rebuild itself emits) into a single [ _advancePlaylist ] run.
+  bool _advancingPlaylist = false;
+  /// Set while [ _advancePlaylist ]'s body is actually executing — used
+  /// together with [_advancingPlaylist] to drop requests that arrive while
+  /// a rebuild is already running (double setAudioSources = crash).
+  bool _playlistAdvanceRunning = false;
+
+  /// Rebuilds the just_audio playlist so the chapter we just auto-advanced
+  /// into sits at index 0, with its own successor at index 1 — so the
+  /// prefetch chain keeps rolling. Uses [state.chapterIndex] + 1 as the
+  /// new current, + 2 as the new prefetch.
+  Future<void> _advancePlaylist() async {
+    if (_advancingPlaylist && _playlistAdvanceRunning) return;
+    _playlistAdvanceRunning = true;
+    try {
+      final item = _loadedItem;
+    if (item == null) return;
+    final handler = ref.read(audioHandlerProvider);
+    final nextIdx = state.chapterIndex + 1;
+    if (nextIdx >= item.chapters.length) return;
+    final config = ref.read(configProvider);
+    final offlineBook = ref.read(offlineStoreProvider).books[item.id];
+    final files = item.audioFiles
+        .map((f) => (ino: f.ino, duration: f.duration))
+        .toList();
+
+    Future<({String? fileIno, double startSec, double endSec, String? filePath})>
+        resolveClipBounds(int chIdx) async {
+      const empty = (fileIno: null, startSec: 0.0, endSec: 0.0, filePath: null);
+      if (chIdx >= item.chapters.length) return empty;
+      final ch = item.chapters[chIdx];
+      final (ino, startOffset) = AudiobookAudioHandler.resolveFilePosition(
+        files: files,
+        seconds: ch.start,
+      );
+      final (endIno, endOffset) = AudiobookAudioHandler.resolveFilePosition(
+        files: files,
+        seconds: ch.end,
+      );
+      // Skip prefetch for chapters that span files (can't be expressed
+      // as a single ClippingAudioSource).
+      if (ino.isEmpty || endIno != ino) return empty;
+      String? filePath;
+      if (offlineBook != null) {
+        final af = item.audioFiles.firstWhere(
+          (f) => f.ino == ino,
+          orElse: () => const AbsAudioFile(ino: '', duration: 0, filename: ''),
+        );
+        if (af.ino.isEmpty) return empty;
+        final p = '${offlineBook.dirPath}/${af.offlineFilename}';
+        if (await File(p).exists()) {
+          filePath = p;
+        } else {
+          return empty;
+        }
+      }
+      return (fileIno: ino, startSec: startOffset, endSec: endOffset, filePath: filePath);
+    }
+
+    final current = await resolveClipBounds(nextIdx);
+    final prefetch = await resolveClipBounds(nextIdx + 1);
+    if (current.fileIno == null) return; // can't even queue the current chapter
+
+    final sources = <AudioSource>[
+      _buildChapterSource(item.id, config, current, isOffline: offlineBook != null),
+      if (prefetch.fileIno != null)
+        _buildChapterSource(
+            item.id, config, prefetch, isOffline: offlineBook != null),
+    ];
+
+    await handler.player.setAudioSources(
+      sources,
+      initialIndex: 0,
+      initialPosition: Duration.zero,
+    );
+
+    // Update state + sync bookkeeping for the new current chapter.
+    final nextChapter = item.chapters[nextIdx];
+    _syncChapterStart = nextChapter.start;
+    _chapterOffsetSeconds = 0;
+    _syncStartedAt = DateTime.now().millisecondsSinceEpoch;
+    _lastPosition = Duration.zero;
+    _lastEmitMs = 0;
+    state = state.copyWith(
+      chapterIndex: nextIdx,
+      chapterDuration: nextChapter.duration.asDuration,
+      position: Duration.zero,
+      chapterStartInBook: nextChapter.start,
+      // The transcript cues/word-cursor belong to the previous chapter —
+      // clear them here (the async VTT load below replaces them). Leaving
+      // the old cues in place made _syncWord highlight stale cues and the
+      // reading view fight the chapter transition at the boundary.
+      clearWord: true,
+    );
+
+    // Load the new chapter's transcript. The old chapter's VTT (with its
+    // stale cue list and word cursor) must not carry over — the reading
+    // view rebuilds its auto-scroll bookkeeping off the cue-count change,
+    // which only happens once the new VTT lands.
+    unawaited(_loadVtt(item.id, nextIdx).then((_) {
+      if (state.vttStatus == VttStatus.ready) _syncWord(state.position);
+    }));
+    } finally {
+      _playlistAdvanceRunning = false;
+    }
+  }
+
+  /// Builds a single chapter's [AudioSource] — either a clipped URL
+  /// source (streaming) or a clipped file source (offline). The clip
+  /// window is what makes the player stop exactly at chapter end and
+  /// trigger the auto-advance to the queued next chapter.
+  AudioSource _buildChapterSource(
+    String itemId,
+    AppConfig config,
+    ({String? fileIno, double startSec, double endSec, String? filePath}) clip, {
+    required bool isOffline,
+  }) {
+    final ino = clip.fileIno!;
+    final start = Duration(milliseconds: (clip.startSec * 1000).toInt());
+    final end = Duration(milliseconds: (clip.endSec * 1000).toInt());
+    if (isOffline) {
+      return ClippingAudioSource(
+        child: AudioSource.uri(Uri.file(clip.filePath!)),
+        start: start,
+        end: end,
+      );
+    }
+    return ClippingAudioSource(
+      child: AudioSource.uri(
+        Uri.parse('${config.absUrl}/api/items/$itemId/file/$ino'),
+        headers: {'Authorization': 'Bearer ${config.absToken}'},
+      ),
+      start: start,
+      end: end,
+    );
   }
 
   // ── Sleep timer ────────────────────────────────────────────────────
@@ -755,7 +1080,7 @@ class PlayerController extends Notifier<PlayerState> {
   Future<bool> transcribeCurrentChapter() async {
     final itemId = state.itemId;
     if (itemId == null) return false;
-    if (!ref.read(configProvider).backendConfigured) return false;
+    if (!ref.read(configProvider).serverConfigured) return false;
     final backend = ref.read(backendClientProvider);
     try {
       final res = await backend.post(

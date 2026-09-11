@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
+import '../../core/providers/playback_progress_provider.dart';
 import '../../core/providers/read_chapters_provider.dart';
 import '../../core/providers/shared_prefs_provider.dart';
 import '../../core/theme/app_theme.dart';
@@ -45,29 +46,21 @@ class BookDetailScreen extends ConsumerWidget {
             final config = ref.watch(configProvider);
             final prefs = ref.watch(sharedPrefsProvider);
             final lastPlayed =
-                book.resumePosition()?.chapterIndex ??
+                BookPlaybackProgress.fromPrefs(prefs, itemId)
+                    ?.chapterIndex ??
                 AppConfig.lastPlayedChapter(prefs, itemId) ??
                 0;
             // After a fresh install / app reinstall, the local listened-chapter
-            // set is empty (it was wiped in SharedPreferences). When the server
-            // reports a resume position, rebuild the listened badges from it —
-            // best-effort: marks every chapter whose end falls at or before the
-            // resume point (plus a small tolerance for stale-ABS drift) as
-            // listened. No-op if the user already has local progress for this
-            // book (in-session work, or progress that landed on the server between
+            // set is empty (it was wiped in SharedPreferences). Rebuild the
+            // badges from the metadata server's per-book data when available —
+            // no-op if the user already has local progress for this book
+            // (in-session work, or progress that landed on the server between
             // the wipe and this call).
-            final resumeSec = book.resumeSeconds;
-            if (resumeSec != null && resumeSec > 0) {
-              unawaited(
-                ref
-                    .read(readChaptersProvider.notifier)
-                    .restoreFromServerProgress(
-                      itemId,
-                      resumeSec,
-                      book.chapters,
-                    ),
-              );
-            }
+            unawaited(
+              ref
+                  .read(readChaptersProvider.notifier)
+                  .restoreFromServerProgress(itemId, book.chapters),
+            );
             final statuses = jobsAsync.valueOrNull ?? const {};
             final active = activeJobsAsync.valueOrNull ?? const [];
 
@@ -175,7 +168,7 @@ class BookDetailScreen extends ConsumerWidget {
     if (book == null) return;
 
     // Transcription needs the optional backend server.
-    if (!ref.read(configProvider).backendConfigured) {
+    if (!ref.read(configProvider).serverConfigured) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(

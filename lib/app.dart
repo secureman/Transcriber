@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import 'core/providers/config_provider.dart';
+import 'core/network/metadata_client.dart';
 import 'core/theme/app_theme.dart';
 import 'features/book_detail/book_detail_screen.dart';
 import 'features/library/library_screen.dart';
@@ -21,9 +22,12 @@ final routerProvider = Provider<GoRouter>((ref) {
     initialLocation: '/',
     redirect: (context, state) {
       final config = ref.read(configProvider);
-      final isSetup = state.matchedLocation == '/setup';
-      if (!config.isConfigured && !isSetup) return '/setup';
-      if (config.isConfigured && isSetup) return '/';
+      final location = state.matchedLocation;
+      final isSetup = location == '/setup';
+      // No server config yet → first-run setup.
+      if (!config.isConfigured) return isSetup ? null : '/setup';
+      // Configured but still on the setup screen → home.
+      if (isSetup) return '/';
       return null;
     },
     routes: [
@@ -39,7 +43,7 @@ final routerProvider = Provider<GoRouter>((ref) {
         routes: [
           GoRoute(
             path: '/',
-            builder: (context, state) => const LibraryScreen(),
+            builder: (context, state) => const HomeScreen(),
           ),
           GoRoute(
             path: '/book/:id',
@@ -89,6 +93,10 @@ class EReaderApp extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    // Fire the once-per-launch listen-progress restore whenever the backend
+    // client is ready (config present). The provider dedupes itself —
+    // re-watching it from every shell rebuild is free.
+    ref.watch(startupProgressRestoreProvider);
     final router = ref.watch(routerProvider);
     return MaterialApp.router(
       title: 'Echoread',

@@ -25,6 +25,15 @@ flutter run
 Point the app at your Audiobookshelf URL + token in the in-app settings,
 and at the transcription server URL for read-along support.
 
+## Progress / metadata server
+
+User accounts and reading-progress sync (listened chapters, chapter
+positions, continue-reading bookmarks) live in a separate repo:
+[secureman/metadata-server](https://github.com/secureman/metadata-server) —
+a self-hosted FastAPI + SQLite service. Set its URL in the app's setup /
+settings screen; the server's README covers hosting (including Termux)
+and the API reference.
+
 ## Transcription server
 
 Setup, API reference and Termux hosting guide live in

@@ -1,15 +1,15 @@
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../core/network/abs_sync.dart';
 import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
 import '../../core/theme/app_theme.dart';
+import '../../core/widgets/error_banner.dart';
+import '../../core/widgets/primary_button.dart';
 import '../library/library_provider.dart';
 import '../setup/setup_provider.dart';
+import '../setup/widgets/custom_text_field.dart';
 
 /// Editable ABS / transcription server settings. Reuses the same health-check
 /// controller as the setup screen.
@@ -23,15 +23,19 @@ class SettingsScreen extends ConsumerStatefulWidget {
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final _absUrlController = TextEditingController();
   final _absTokenController = TextEditingController();
-  final _backendUrlController = TextEditingController();
+  final _serverUrlController = TextEditingController();
   final _formKey = GlobalKey<FormState>();
   bool _prefilled = false;
+
+  // Local visibility toggle for the API key. Mirrors the setup screen so
+  // both flows feel consistent when editing existing credentials.
+  bool _obscureApiKey = true;
 
   @override
   void dispose() {
     _absUrlController.dispose();
     _absTokenController.dispose();
-    _backendUrlController.dispose();
+    _serverUrlController.dispose();
     super.dispose();
   }
 
@@ -41,7 +45,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final config = ref.read(configProvider);
     _absUrlController.text = config.absUrl;
     _absTokenController.text = config.absToken;
-    _backendUrlController.text = config.backendUrl;
+    _serverUrlController.text = config.serverUrl;
   }
 
   Future<void> _save() async {
@@ -51,18 +55,20 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final ok = await ref.read(setupControllerProvider.notifier).testAndSave(
           absUrl: _absUrlController.text.trim(),
           absToken: _absTokenController.text.trim(),
-          backendUrl: _backendUrlController.text.trim(),
+          serverUrl: _serverUrlController.text.trim(),
         );
 
     if (!mounted) return;
-    if (ok) {
-      // Server settings changed → refresh data fetched with the old config.
-      ref.invalidate(libraryItemsProvider);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Settings saved')),
-      );
-      context.pop();
-    }
+    if (!ok) return;
+
+    // Server settings changed → refresh data fetched with the old config.
+    ref.invalidate(libraryItemsProvider);
+    // The server URL may have changed too — the Dio client reads
+    // it through configProvider, and the bulk fetch re-arms on next read.
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Settings saved')),
+    );
+    context.pop();
   }
 
   @override
@@ -71,6 +77,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final state = ref.watch(setupControllerProvider);
 
     return Scaffold(
+      backgroundColor: AppColors.background,
       appBar: AppBar(
         title: const Text('Settings'),
         leading: IconButton(
@@ -80,107 +87,73 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       ),
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
           child: Form(
             key: _formKey,
             child: Column(
-              mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const _SignedInCard(),
-                const SizedBox(height: 20),
-                const Text(
-                  'Server Configuration',
-                  style: TextStyle(
-                      color: AppColors.primary,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 20),
-                TextFormField(
+                const _SectionLabel('Server Configuration'),
+                const SizedBox(height: 12),
+                CustomTextField(
                   controller: _absUrlController,
+                  label: 'Server URL',
+                  hint: 'http://192.168.1.10:13378',
+                  helperText: 'Your Audiobookshelf server address',
                   keyboardType: TextInputType.url,
-                  style: const TextStyle(color: AppColors.textPrimary),
-                  decoration: const InputDecoration(
-                    labelText: 'ABS Server URL',
-                    hintText: 'http://192.168.1.10:13378',
-                    prefixIcon: Icon(Icons.dns_outlined,
-                        color: AppColors.textSecondary),
-                  ),
-                  validator: (v) =>
-                      (v == null || v.trim().isEmpty) ? 'Required' : null,
+                  textInputAction: TextInputAction.next,
+                  validator: (v) => (v == null || v.trim().isEmpty)
+                      ? 'Server URL is required'
+                      : null,
                 ),
-                const SizedBox(height: 16),
-                TextFormField(
+                const SizedBox(height: 20),
+                CustomTextField(
                   controller: _absTokenController,
-                  obscureText: true,
-                  style: const TextStyle(color: AppColors.textPrimary),
-                  decoration: const InputDecoration(
-                    labelText: 'ABS API Token',
-                    hintText: 'ey...',
-                    prefixIcon: Icon(Icons.key_outlined,
-                        color: AppColors.textSecondary),
-                  ),
-                  validator: (v) =>
-                      (v == null || v.trim().isEmpty) ? 'Required' : null,
-                ),
-                const SizedBox(height: 16),
-                TextFormField(
-                  controller: _backendUrlController,
-                  keyboardType: TextInputType.url,
-                  style: const TextStyle(color: AppColors.textPrimary),
-                  decoration: const InputDecoration(
-                    labelText: 'Transcription Server URL (optional)',
-                    hintText: 'http://192.168.1.10:8000',
-                    prefixIcon:
-                        Icon(Icons.graphic_eq, color: AppColors.textSecondary),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  'The transcription server is optional. Without it you can '
-                  'still browse and play, but the word-by-word text view and '
-                  'transcription are unavailable.',
-                  style: TextStyle(
-                      color: AppColors.textSecondary, fontSize: 12),
-                ),
-                const SizedBox(height: 24),
-                if (state.error != null)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 16),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.error_outline,
-                            color: AppColors.error, size: 20),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            state.error!,
-                            style: const TextStyle(color: AppColors.error),
-                          ),
-                        ),
-                      ],
+                  label: 'API Key',
+                  hint: 'Enter your API key',
+                  helperText: 'Settings → API Keys in Audiobookshelf',
+                  obscureText: _obscureApiKey,
+                  textInputAction: TextInputAction.next,
+                  suffixIcon: IconButton(
+                    icon: Icon(
+                      _obscureApiKey
+                          ? Icons.visibility_off_outlined
+                          : Icons.visibility_outlined,
+                      color: AppColors.textSecondary,
+                      size: 20,
                     ),
+                    onPressed: () =>
+                        setState(() => _obscureApiKey = !_obscureApiKey),
+                    tooltip: _obscureApiKey ? 'Show' : 'Hide',
                   ),
-                FilledButton(
-                  onPressed: state.testing ? null : _save,
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size.fromHeight(50),
-                  ),
-                  child: state.testing
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: AppColors.highlightText,
-                          ),
-                        )
-                      : const Text('TEST & SAVE'),
+                  validator: (v) => (v == null || v.trim().isEmpty)
+                      ? 'API key is required'
+                      : null,
                 ),
+                const SizedBox(height: 20),
+                CustomTextField(
+                  controller: _serverUrlController,
+                  label: 'Audiobook Server',
+                  hint: 'http://192.168.1.20:8001',
+                  helperText:
+                      'Reading progress & transcription — one server. No '
+                      'account needed; your API key identifies you.',
+                  keyboardType: TextInputType.url,
+                  textInputAction: TextInputAction.done,
+                  onFieldSubmitted: (_) => _save(),
+                ),
+                if (state.error != null) ...[
+                  const SizedBox(height: 16),
+                  ErrorBanner(message: state.error!),
+                ],
                 const SizedBox(height: 24),
+                PrimaryButton(
+                  loading: state.testing,
+                  onPressed: state.testing ? null : _save,
+                  label: 'Save',
+                ),
+                const SizedBox(height: 32),
                 const _OfflineStorageSection(),
-                const SizedBox(height: 24),
               ],
             ),
           ),
@@ -190,177 +163,22 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 }
 
-class _SignedInCard extends ConsumerWidget {
-  const _SignedInCard();
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final userAsync = ref.watch(currentUserProvider);
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(AppColors.cardRadius),
-        border: Border.all(color: AppColors.surfaceElevated),
-      ),
-      child: userAsync.when(
-        loading: () => const Row(
-          children: [
-            SizedBox(
-              width: 20,
-              height: 20,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: AppColors.primary,
-              ),
-            ),
-            SizedBox(width: 12),
-            Text(
-              'Connecting to Audiobookshelf…',
-              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
-            ),
-          ],
-        ),
-        error: (_, _) => _row(
-          icon: Icons.cloud_off_rounded,
-          title: 'Can’t verify user',
-          subtitle: 'Check the server and try again',
-        ),
-        data: (user) {
-          if (user == null) {
-            return _row(
-              icon: Icons.person_off_outlined,
-              title: 'Not signed in',
-              subtitle: 'Check your ABS URL & token',
-            );
-          }
-          return Row(
-            children: [
-              _Avatar(avatar: user.avatar, name: user.displayName),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      user.displayName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: AppColors.textPrimary,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      '@${user.username} · listening sync on',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: AppColors.textSecondary,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              IconButton(
-                tooltip: 'Refresh user',
-                visualDensity: VisualDensity.compact,
-                icon: const Icon(Icons.refresh,
-                    size: 18, color: AppColors.textSecondary),
-                onPressed: () => ref.invalidate(currentUserProvider),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _row({
-    required IconData icon,
-    required String title,
-    required String subtitle,
-  }) {
-    return Row(
-      children: [
-        Icon(icon, color: AppColors.textSecondary, size: 26),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(title,
-                  style: const TextStyle(
-                      color: AppColors.textPrimary, fontSize: 15)),
-              const SizedBox(height: 2),
-              Text(subtitle,
-                  style: const TextStyle(
-                      color: AppColors.textSecondary, fontSize: 12)),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _Avatar extends StatelessWidget {
-  final String? avatar;
-  final String name;
-
-  const _Avatar({required this.avatar, required this.name});
+class _SectionLabel extends StatelessWidget {
+  final String text;
+  const _SectionLabel(this.text);
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 44,
-      height: 44,
-      child: _image(),
+    return Text(
+      text,
+      style: const TextStyle(
+        color: AppColors.primary,
+        fontSize: 14,
+        fontWeight: FontWeight.w600,
+        letterSpacing: 0.2,
+      ),
     );
   }
-
-  Widget _image() {
-    final data = avatar;
-    if (data != null && data.startsWith('data:image') && data.contains(',')) {
-      try {
-        final bytes = base64Decode(data.split(',').last);
-        return ClipOval(
-          child: Image.memory(
-            bytes,
-            width: 44,
-            height: 44,
-            fit: BoxFit.cover,
-            errorBuilder: (_, _, _) => _fallback(),
-          ),
-        );
-      } catch (_) {
-        return _fallback();
-      }
-    }
-    return _fallback();
-  }
-
-  Widget _fallback() => Container(
-        width: 44,
-        height: 44,
-        decoration: const BoxDecoration(
-          color: AppColors.surfaceElevated,
-          shape: BoxShape.circle,
-        ),
-        alignment: Alignment.center,
-        child: Text(
-          name.isEmpty ? '?' : name[0].toUpperCase(),
-          style: const TextStyle(
-            color: AppColors.primary,
-            fontWeight: FontWeight.w600,
-            fontSize: 18,
-          ),
-        ),
-      );
 }
 
 class _OfflineStorageSection extends ConsumerWidget {
@@ -388,8 +206,9 @@ class _OfflineStorageSection extends ConsumerWidget {
             'Offline Downloads',
             style: TextStyle(
               color: AppColors.primary,
-              fontSize: 15,
+              fontSize: 14,
               fontWeight: FontWeight.w600,
+              letterSpacing: 0.2,
             ),
           ),
           const SizedBox(height: 12),

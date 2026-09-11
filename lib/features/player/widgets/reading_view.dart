@@ -311,7 +311,7 @@ class _ReadingViewState extends ConsumerState<ReadingView> {
       );
     }
 
-    final hasBe = ref.watch(configProvider).backendConfigured;
+    final hasBe = ref.watch(configProvider).serverConfigured;
     return ColoredBox(
       color: theme.background,
       child: Center(

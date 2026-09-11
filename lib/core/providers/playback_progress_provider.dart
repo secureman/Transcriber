@@ -6,10 +6,10 @@ import 'config_provider.dart';
 
 /// Key prefix for the local per-book playback progress store.
 ///
-/// Progress is also synced to the Audiobookshelf server while online (see
-/// abs_sync.dart), but this local copy guarantees the user's place survives
-/// app kills, backgrounding, and offline sessions where server sync gets
-/// disabled after repeated failures. Every record is keyed by the stable
+/// Progress is also synced to the metadata (reading progress) server while
+/// online (see progress_sync.dart), but this local copy guarantees the
+/// user's place survives app kills, backgrounding, and offline sessions
+/// where server sync gets disabled after repeated failures. Every record is keyed by the stable
 /// ABS item id — never the title — so a title/author rename can't orphan a
 /// saved position.
 const playbackProgressPrefsKey = 'playback_progress';

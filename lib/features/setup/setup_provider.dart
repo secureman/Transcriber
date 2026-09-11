@@ -10,7 +10,7 @@ Dio _plainDio() => Dio(BaseOptions(
       validateStatus: (status) => status != null && status < 500,
     ));
 
-enum SetupField { absUrl, absToken, backendUrl }
+enum SetupField { absUrl, absToken, serverUrl }
 
 class SetupState {
   final bool testing;
@@ -43,21 +43,22 @@ class SetupController extends Notifier<SetupState> {
   Future<bool> testAndSave({
     required String absUrl,
     required String absToken,
-    required String backendUrl,
+    required String serverUrl,
   }) async {
     state = const SetupState(testing: true);
 
     // Normalize URLs (strip trailing slash).
     absUrl = absUrl.endsWith('/') ? absUrl.substring(0, absUrl.length - 1) : absUrl;
-    backendUrl =
-        backendUrl.endsWith('/') ? backendUrl.substring(0, backendUrl.length - 1) : backendUrl;
+    serverUrl =
+        serverUrl.endsWith('/') ? serverUrl.substring(0, serverUrl.length - 1) : serverUrl;
 
-    // 1. Test backend health — only if provided (it is optional).
-    if (backendUrl.isNotEmpty) {
-      final backendError = await _testBackend(backendUrl);
-      if (backendError != null) {
+    // 1. Test unified server health — only if provided (it is optional;
+    //    playback works without it, accounts/progress/text do not).
+    if (serverUrl.isNotEmpty) {
+      final serverError = await _testServer(serverUrl);
+      if (serverError != null) {
         state = SetupState(
-          error: 'Transcription server unreachable: $backendUrl ($backendError)',
+          error: 'Audiobook server unreachable: $serverUrl ($serverError)',
         );
         return false;
       }
@@ -75,7 +76,7 @@ class SetupController extends Notifier<SetupState> {
     await AppConfig(
       absUrl: absUrl,
       absToken: absToken,
-      backendUrl: backendUrl,
+      serverUrl: serverUrl,
     ).saveToPrefs(prefs);
     ref.read(configRevisionProvider.notifier).state++;
 
@@ -83,7 +84,7 @@ class SetupController extends Notifier<SetupState> {
     return true;
   }
 
-  Future<String?> _testBackend(String url) async {
+  Future<String?> _testServer(String url) async {
     try {
       final dio = _plainDio();
       final res = await dio.get('$url/api/health');
@@ -104,6 +105,7 @@ class SetupController extends Notifier<SetupState> {
       return e.toString().split('\n').first;
     }
   }
+
 }
 
 final setupControllerProvider =

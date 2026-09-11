@@ -7,11 +7,14 @@ import '../player_state.dart';
 import 'sleep_timer_sheet.dart';
 import 'speed_sheet.dart';
 
-/// Playback control row, redesigned to match the reference screenshot:
-/// sleep timer — 15s back — big outlined play/pause — 30s forward — speed.
-/// Chapter prev/next now live in the chapter list sheet (see chapter_sheet.dart)
-/// rather than in this row, matching the reference layout, which has no
-/// prev/next-chapter buttons here at all.
+/// Playback controls, two rows:
+///
+///  * primary — prev chapter · back 15s · big play/pause · forward 30s ·
+///    next chapter (the podcast-style transport the approved plan calls
+///    for; at the first chapter, prev restarts the current chapter from
+///    the top, at the last chapter, next does nothing)
+///  * secondary — sleep timer and the speed stepper, out of the way of
+///    the thumb's main arc but still one tap deep.
 class AudioControls extends ConsumerWidget {
   const AudioControls({super.key});
 
@@ -23,25 +26,90 @@ class AudioControls extends ConsumerWidget {
     final compact = MediaQuery.sizeOf(context).width < 360;
     return Padding(
       padding: EdgeInsets.symmetric(horizontal: compact ? 2 : 8),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+      child: Column(
         children: [
-          _SleepButton(active: player.sleepTimer != SleepTimerState.off),
-          _SkipButton(
-            icon: Icons.replay_rounded,
-            label: '15',
-            onTap: () => notifier.skipBackward15(),
-            tooltip: 'Back 15s',
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _ChapterSkipButton(
+                icon: Icons.skip_previous_rounded,
+                onTap: player.chapterIndex > 0 || player.audioReady
+                    ? () => notifier.prevChapter()
+                    : null,
+                tooltip: player.chapterIndex > 0
+                    ? 'Previous chapter'
+                    : 'Restart chapter',
+              ),
+              _SkipButton(
+                icon: Icons.replay_rounded,
+                label: '15',
+                onTap: () => notifier.skipBackward15(),
+                tooltip: 'Back 15s',
+              ),
+              const _PlayPauseButton(),
+              _SkipButton(
+                icon: Icons.forward_rounded,
+                label: '30',
+                onTap: () => notifier.skipForward30(),
+                tooltip: 'Forward 30s',
+              ),
+              _ChapterSkipButton(
+                icon: Icons.skip_next_rounded,
+                onTap: player.isOnLastChapter
+                    ? null
+                    : () => notifier.nextChapter(),
+                tooltip: player.isOnLastChapter
+                    ? 'Last chapter'
+                    : 'Next chapter',
+              ),
+            ],
           ),
-          const _PlayPauseButton(),
-          _SkipButton(
-            icon: Icons.forward_rounded,
-            label: '30',
-            onTap: () => notifier.skipForward30(),
-            tooltip: 'Forward 30s',
+          const SizedBox(height: 2),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _SleepButton(active: player.sleepTimer != SleepTimerState.off),
+              const _SpeedStepper(),
+            ],
           ),
-          const _SpeedStepper(),
         ],
+      ),
+    );
+  }
+}
+
+/// Prev/next-chapter transport button: a filled round glyph like the
+/// built-in skip icons, dimmed when the action is unavailable (next on the
+/// last chapter).
+class _ChapterSkipButton extends StatelessWidget {
+  const _ChapterSkipButton({
+    required this.icon,
+    required this.onTap,
+    required this.tooltip,
+  });
+
+  final IconData icon;
+  final VoidCallback? onTap;
+  final String tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: InkResponse(
+        onTap: onTap,
+        radius: 26,
+        child: SizedBox(
+          width: 40,
+          height: 40,
+          child: Icon(
+            icon,
+            size: 34,
+            color: onTap == null
+                ? AppColors.textSecondary.withValues(alpha: 0.4)
+                : AppColors.textPrimary,
+          ),
+        ),
       ),
     );
   }

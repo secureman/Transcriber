@@ -5,21 +5,47 @@ import 'package:just_audio/just_audio.dart';
 /// Limits playback to a chapter's time window inside the ABS audio file
 /// via [ClippingAudioSource].
 class AudiobookAudioHandler extends BaseAudioHandler {
-  final AudioPlayer player = AudioPlayer();
+  /// Single shared player. Configured with platform-specific load
+  /// controls that keep ~60 s of audio buffered ahead of the playhead
+  /// (default is ~30 s) — see [_loadControl] below for the rationale.
+  final AudioPlayer player = AudioPlayer(audioLoadConfiguration: _loadControl);
+
+  static AudioLoadConfiguration get _loadControl => AudioLoadConfiguration(
+        // Android: explicit min/max buffer windows. The defaults are
+        // 50 s, which is already generous; bumping to 60 s gives a bit
+        // more headroom on slow/lossy networks.
+        androidLoadControl: const AndroidLoadControl(
+          minBufferDuration: Duration(seconds: 60),
+          maxBufferDuration: Duration(seconds: 60),
+        ),
+        // iOS/macOS: ask the system to keep ~60 s of forward buffer.
+        darwinLoadControl: const DarwinLoadControl(
+          preferredForwardBufferDuration: Duration(seconds: 60),
+        ),
+      );
 
   AudiobookAudioHandler() {
     // Report playback state changes to the system (lock screen / notif).
     player.playbackEventStream.map(_transformEvent).pipe(playbackState);
   }
 
-  /// Loads a chapter's audio clip from the ABS server.
+  /// Loads a chapter's audio clip from the ABS server, **plus the next
+  /// chapter's clip** if [nextFileIno] / [nextStartSec] / [nextEndSec] are
+  /// provided. Passing them as a two-element playlist lets `just_audio`
+  /// fetch and buffer the next clip in the background while the current
+  /// one plays — the inter-chapter transition is gapless (auto-advance)
+  /// instead of stalling on a fresh HTTP request.
   ///
   /// [startSec]/[endSec] are the chapter boundaries in seconds, either in the
   /// whole-book timeline (single-file books) or within [fileIno]'s file
   /// (multi-file books, offsets already mapped by the caller).
   ///
   /// [title]/[artist] populate the background notification + lock screen.
-  Future<void> loadChapter({
+  ///
+  /// Returns the initial playlist index (always 0 — the current chapter
+  /// is at the head). The caller listens to `player.currentIndexStream`
+  /// to detect the auto-advance to index 1 (chapter ended).
+  Future<int> loadChapter({
     required String absUrl,
     required String token,
     required String itemId,
@@ -30,19 +56,30 @@ class AudiobookAudioHandler extends BaseAudioHandler {
     String? artist,
     int chapterNumber = 0,
     int totalChapters = 0,
-  }) async {
-    final fileUrl = '$absUrl/api/items/$itemId/file/$fileIno';
-    final source = ClippingAudioSource(
-      child: AudioSource.uri(
-        Uri.parse(fileUrl),
-        headers: {'Authorization': 'Bearer $token'},
-      ),
-      start: Duration(milliseconds: (startSec * 1000).toInt()),
-      end: Duration(milliseconds: (endSec * 1000).toInt()),
-    );
-    await player.setAudioSource(source);
 
-    // Update the lock-screen / notification metadata.
+    /// Optional next-chapter clip for prefetch. All three must be provided
+    /// together; if any is null the playlist is single-item (no prefetch).
+    String? nextFileIno,
+    double? nextStartSec,
+    double? nextEndSec,
+  }) async {
+    final sources = <AudioSource>[
+      _urlClip(absUrl, token, itemId, fileIno, startSec, endSec),
+      if (nextFileIno != null &&
+          nextStartSec != null &&
+          nextEndSec != null)
+        _urlClip(absUrl, token, itemId, nextFileIno, nextStartSec, nextEndSec),
+    ];
+
+    // useLazyPreparation: true (default) is what enables the prefetch —
+    // just_audio prepares source[0] immediately and starts preparing
+    // source[1] in the background, so it's ready when index 0 ends.
+    await player.setAudioSources(
+      sources,
+      initialIndex: 0,
+      initialPosition: Duration.zero,
+    );
+
     mediaItem.add(MediaItem(
       id: '$itemId-$fileIno-$chapterNumber',
       title: title ?? 'Audiobook',
@@ -50,11 +87,14 @@ class AudiobookAudioHandler extends BaseAudioHandler {
       album: totalChapters > 0 ? 'Chapter $chapterNumber of $totalChapters' : null,
       duration: Duration(milliseconds: ((endSec - startSec) * 1000).toInt()),
     ));
+
+    return 0;
   }
 
   /// Loads a chapter from a file already downloaded to device storage
-  /// (offline playback). Same clipping semantics as [loadChapter].
-  Future<void> loadChapterFromFile({
+  /// (offline playback). Same clipping + prefetch semantics as
+  /// [loadChapter]; both source files must already be on disk.
+  Future<int> loadChapterFromFile({
     required String filePath,
     required double startSec,
     required double endSec,
@@ -62,13 +102,23 @@ class AudiobookAudioHandler extends BaseAudioHandler {
     String? artist,
     int chapterNumber = 0,
     int totalChapters = 0,
+
+    /// Optional next-chapter clip for prefetch.
+    String? nextFilePath,
+    double? nextStartSec,
+    double? nextEndSec,
   }) async {
-    final source = ClippingAudioSource(
-      child: AudioSource.uri(Uri.file(filePath)),
-      start: Duration(milliseconds: (startSec * 1000).toInt()),
-      end: Duration(milliseconds: (endSec * 1000).toInt()),
+    final sources = <AudioSource>[
+      _fileClip(filePath, startSec, endSec),
+      if (nextFilePath != null && nextStartSec != null && nextEndSec != null)
+        _fileClip(nextFilePath, nextStartSec, nextEndSec),
+    ];
+
+    await player.setAudioSources(
+      sources,
+      initialIndex: 0,
+      initialPosition: Duration.zero,
     );
-    await player.setAudioSource(source);
 
     mediaItem.add(MediaItem(
       id: 'file-$chapterNumber',
@@ -77,6 +127,39 @@ class AudiobookAudioHandler extends BaseAudioHandler {
       album: totalChapters > 0 ? 'Chapter $chapterNumber of $totalChapters' : null,
       duration: Duration(milliseconds: ((endSec - startSec) * 1000).toInt()),
     ));
+
+    return 0;
+  }
+
+  ClippingAudioSource _urlClip(
+    String absUrl,
+    String token,
+    String itemId,
+    String fileIno,
+    double startSec,
+    double endSec,
+  ) {
+    final fileUrl = '$absUrl/api/items/$itemId/file/$fileIno';
+    return ClippingAudioSource(
+      child: AudioSource.uri(
+        Uri.parse(fileUrl),
+        headers: {'Authorization': 'Bearer $token'},
+      ),
+      start: Duration(milliseconds: (startSec * 1000).toInt()),
+      end: Duration(milliseconds: (endSec * 1000).toInt()),
+    );
+  }
+
+  ClippingAudioSource _fileClip(
+    String filePath,
+    double startSec,
+    double endSec,
+  ) {
+    return ClippingAudioSource(
+      child: AudioSource.uri(Uri.file(filePath)),
+      start: Duration(milliseconds: (startSec * 1000).toInt()),
+      end: Duration(milliseconds: ((endSec) * 1000).toInt()),
+    );
   }
 
   /// Finds which audio file contains [seconds] (book timeline) and returns

@@ -19,12 +19,16 @@ class DownloadProgress {
   final int totalFiles;
   final int completedFiles;
 
-  /// 0..1 progress of the file currently being downloaded.
-  final double fileProgress;
+  /// Per-in-flight progress (0..1) keyed by audio file ino. Empty when
+  /// nothing is actively downloading right now (i.e. between worker
+  /// dispatches or after completion).
+  final Map<String, double> progressByIno;
 
-  /// ino of the file currently in flight — lets the chapter list show a
-  /// spinner on exactly the tile being fetched.
-  final String? currentIno;
+  /// inos currently being downloaded — one per parallel worker slot. Used
+  /// by the chapter list to put a spinner on every tile that's in flight,
+  /// not just the most recent one (downloads now run in parallel — see
+  /// `OfflineController._maxConcurrentDownloads`).
+  final Set<String> currentInos;
 
   /// Non-null when the download ended with an error or was cancelled.
   final String? error;
@@ -32,17 +36,30 @@ class DownloadProgress {
   const DownloadProgress({
     this.totalFiles = 1,
     this.completedFiles = 0,
-    this.fileProgress = 0,
-    this.currentIno,
+    this.progressByIno = const <String, double>{},
+    this.currentInos = const <String>{},
     this.error,
   });
 
+  /// 0..1 aggregate progress. Each in-flight file contributes its current
+  /// progress (0..1) and each completed file contributes 1.0; dividing by
+  /// totalFiles yields the fraction of overall work done.
   double get fraction {
     if (totalFiles == 0) return 0;
-    return ((completedFiles + fileProgress) / totalFiles).clamp(0.0, 1.0);
+    final activeSum = progressByIno.values.fold<double>(0, (a, b) => a + b);
+    return ((completedFiles + activeSum) / totalFiles).clamp(0.0, 1.0);
   }
 
   bool get isRunning => error == null;
+
+  /// Backwards-compat for callers that still expect a single "which file
+  /// is being downloaded right now". Returns the first in-flight ino, or
+  /// null when nothing is. Prefer [isInFlight] / [currentInos] for
+  /// per-chapter UI — with parallel downloads there can be more than one.
+  String? get currentIno => currentInos.isEmpty ? null : currentInos.first;
+
+  /// True when [ino] is currently being downloaded by one of the workers.
+  bool isInFlight(String ino) => currentInos.contains(ino);
 }
 
 class OfflineStoreState {
@@ -109,6 +126,13 @@ class OfflineStoreState {
 /// Downloads audiobooks (audio files + cover + transcripts) to app storage
 /// and tracks the set of books available offline.
 class OfflineController extends Notifier<OfflineStoreState> {
+  /// Max audio files fetched in parallel for a single book download. Three
+  /// is the sweet spot for typical ABS audiobook files (50–200 MB each)
+  /// over a home WiFi link — fewer than that leaves bandwidth on the
+  /// table, more risks saturating the LAN and the server's open-file
+  /// limit. Tunable; see the parallel-downloads note in `download`.
+  static const _maxConcurrentDownloads = 3;
+
   final Set<String> _active = {};
   final Map<String, CancelToken> _cancelTokens = {};
 
@@ -197,94 +221,138 @@ class OfflineController extends Notifier<OfflineStoreState> {
           .where((f) => f.ino.isNotEmpty && !checked.contains(f.ino))
           .toList();
 
-      final alreadyDone = wanted.length - pending.length;
       final totalFiles = wanted.length;
+      final alreadyDone = wanted.length - pending.length;
+
+      // Mutable counters shared across the worker pool. Safe under Dart's
+      // single-threaded event loop: every mutation happens between awaits,
+      // and `publishProgress` snapshots them into an immutable
+      // DownloadProgress when it writes to `state`.
       var completed = alreadyDone;
       var totalBytes = 0;
+      final progressByIno = <String, double>{};
+      final currentInos = <String>{};
 
-      _setProgress(
-        itemId,
-        DownloadProgress(totalFiles: totalFiles, completedFiles: completed),
-      );
-      if (pending.isEmpty) {
-        debugPrint('offline: $itemId already downloaded, nothing to do');
-      }
-
-      for (final f in pending) {
-        if (!_active.contains(itemId)) return; // cancelled via remove()
-        final savePath = '${dir.path}/${f.offlineFilename}';
-        final url = '${config.absUrl}/api/items/$itemId/file/${f.ino}';
-
-        Exception? lastError;
-        // Two retries on transient connection errors — phone WiFi to a LAN
-        // server occasionally drops mid-transfer on long downloads.
-        // _downloadFileResumable preserves whatever bytes made it to disk
-        // on failure, and each attempt (including ones from a previous,
-        // fully separate run of this method — e.g. after a crash) picks
-        // up from those bytes via an HTTP Range request instead of
-        // starting the file over from zero.
-        for (var attempt = 0; attempt < 3; attempt++) {
-          try {
-            await _downloadFileResumable(
-              abs: abs,
-              url: url,
-              savePath: savePath,
-              cancelToken: token,
-              onProgress: (fp) => _setProgress(
-                itemId,
-                DownloadProgress(
-                  totalFiles: totalFiles,
-                  completedFiles: completed,
-                  fileProgress: fp,
-                  currentIno: f.ino,
-                ),
-              ),
-            );
-            lastError = null;
-            break;
-          } on DioException catch (e) {
-            if (CancelToken.isCancel(e)) rethrow;
-            lastError = Exception(
-                'Failed to download "${f.filename}" (file ${completed + 1} of $totalFiles): '
-                '${e.type.name} ${e.response?.statusCode ?? ''}'.trim());
-            // Give the server a beat before retrying.
-            await Future<void>.delayed(const Duration(seconds: 1));
-          }
-        }
-        if (lastError != null) throw lastError;
-
-        final saved = File(savePath);
-        if (!await saved.exists() || await saved.length() == 0) {
-          throw Exception('Downloaded file was empty: ${f.filename}');
-        }
-        final bytes = await saved.length();
-        totalBytes += bytes;
-        // Mark THIS chapter as downloaded (persisted) as soon as its file is
-        // complete — a crash mid-run still leaves usable partial progress.
-        await OfflineDatabase.markChapter(
-          itemId,
-          f.ino,
-          fileName: f.offlineFilename,
-          bytes: bytes,
-        );
-        state = state.copyWith(
-          chapters: {
-            ...state.chapters,
-            itemId: {...(state.chapters[itemId] ?? const <String>{}), f.ino},
-          },
-        );
-        completed++;
+      void publishProgress() {
         _setProgress(
           itemId,
           DownloadProgress(
             totalFiles: totalFiles,
             completedFiles: completed,
+            progressByIno: Map.unmodifiable(progressByIno),
+            currentInos: Set.unmodifiable(currentInos),
           ),
         );
       }
 
-      // Count bytes of files already present from a previous run so the size
-      // shown in the UI stays correct after resuming.
+      publishProgress();
+      if (pending.isEmpty) {
+        debugPrint('offline: $itemId already downloaded, nothing to do');
+      }
+
+      Future<void> worker() async {
+        while (pending.isNotEmpty) {
+          if (!_active.contains(itemId)) return;
+          if (token.isCancelled) return;
+
+          final f = pending.removeAt(0);
+          currentInos.add(f.ino);
+          progressByIno[f.ino] = 0;
+          publishProgress();
+
+          final savePath = '${dir.path}/${f.offlineFilename}';
+          final url = '${config.absUrl}/api/items/$itemId/file/${f.ino}';
+
+          try {
+            // Two retries on transient connection errors — phone WiFi to a
+            // LAN server occasionally drops mid-transfer on long downloads.
+            // _downloadFileResumable preserves whatever bytes made it to disk
+            // on failure, and each attempt (including ones from a previous,
+            // fully separate run of this method — e.g. after a crash) picks
+            // up from those bytes via an HTTP Range request instead of
+            // starting the file over from zero.
+            Exception? lastError;
+            for (var attempt = 0; attempt < 3; attempt++) {
+              if (!_active.contains(itemId)) return;
+              if (token.isCancelled) return;
+              try {
+                await _downloadFileResumable(
+                  abs: abs,
+                  url: url,
+                  savePath: savePath,
+                  cancelToken: token,
+                  onProgress: (fp) {
+                    progressByIno[f.ino] = fp;
+                    publishProgress();
+                  },
+                );
+                lastError = null;
+                break;
+              } on DioException catch (e) {
+                if (CancelToken.isCancel(e)) return; // cancelled by sibling
+                lastError = Exception(
+                    'Failed to download "${f.filename}" (file ${completed + 1} of $totalFiles): '
+                    '${e.type.name} ${e.response?.statusCode ?? ''}'.trim());
+                // Give the server a beat before retrying.
+                await Future<void>.delayed(const Duration(seconds: 1));
+              }
+            }
+            if (lastError != null) {
+              // Cancel sibling workers and bubble up.
+              token.cancel('worker failed');
+              throw lastError;
+            }
+
+            final saved = File(savePath);
+            if (!await saved.exists() || await saved.length() == 0) {
+              token.cancel('empty file');
+              throw Exception('Downloaded file was empty: ${f.filename}');
+            }
+            final bytes = await saved.length();
+            totalBytes += bytes;
+            // Mark THIS chapter as downloaded (persisted) as soon as its file is
+            // complete — a crash mid-run still leaves usable partial progress.
+            await OfflineDatabase.markChapter(
+              itemId,
+              f.ino,
+              fileName: f.offlineFilename,
+              bytes: bytes,
+            );
+            state = state.copyWith(
+              chapters: {
+                ...state.chapters,
+                itemId: {
+                  ...(state.chapters[itemId] ?? const <String>{}),
+                  f.ino,
+                },
+              },
+            );
+            completed++;
+          } finally {
+            currentInos.remove(f.ino);
+            progressByIno.remove(f.ino);
+            publishProgress();
+          }
+        }
+      }
+
+      // Run up to _maxConcurrentDownloads workers in parallel. The pool is
+      // bounded so we don't open N TCP connections per book and saturate
+      // the server / a home WiFi link — 3 is the sweet spot for typical
+      // audiobook files (50–200 MB each) over LAN.
+      final workerCount = pending.length < _maxConcurrentDownloads
+          ? pending.length
+          : _maxConcurrentDownloads;
+      final workers = <Future<void>>[
+        for (var i = 0; i < workerCount; i++) worker(),
+      ];
+      await Future.wait(workers);
+
+      // Check if cancelled mid-flight (via remove()).
+      if (!_active.contains(itemId)) return;
+
+      // Count bytes of files already present from a previous run so the
+      // size shown in the UI stays correct after resuming.
       for (final ino in checked) {
         final f = item.audioFiles.firstWhere(
           (f) => f.ino == ino,
@@ -523,7 +591,7 @@ class OfflineController extends Notifier<OfflineStoreState> {
   }
 
   Future<void> _cacheVttsFor(String itemId, int chapterCount) async {
-    if (!ref.read(configProvider).backendConfigured) return;
+    if (!ref.read(configProvider).serverConfigured) return;
     final backend = ref.read(backendClientProvider);
     try {
       final res = await backend.get('/api/jobs/book/$itemId');

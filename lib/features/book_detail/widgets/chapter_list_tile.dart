@@ -47,7 +47,7 @@ class ChapterListTile extends ConsumerWidget {
     final chapterInFlight = isMultiFile &&
         dl != null &&
         dl.isRunning &&
-        dl.currentIno == audioIno;
+        dl.isInFlight(audioIno);
 
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),

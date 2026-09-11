@@ -61,7 +61,7 @@ class DownloadControl extends ConsumerWidget {
             const SizedBox(height: 6),
             Text(
               progress.totalFiles > 1
-                  ? 'Chapter ${progress.completedFiles + 1} of ${progress.totalFiles}'
+                  ? '${progress.completedFiles} of ${progress.totalFiles} files downloaded'
                   : 'Downloading chapter…',
               style:
                   const TextStyle(color: AppColors.textSecondary, fontSize: 11),

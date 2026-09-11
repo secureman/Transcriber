@@ -4,7 +4,7 @@ import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/network/abs_client.dart';
-import '../../core/network/abs_sync.dart';
+import '../../core/network/metadata_client.dart';
 import '../../core/offline/offline_provider.dart';
 import '../../core/providers/read_chapters_provider.dart';
 import '../../core/providers/shared_prefs_provider.dart';
@@ -103,33 +103,35 @@ class LibraryController extends AsyncNotifier<LibraryState> {
         .toList();
 
     // The library list endpoint never returns per-user progress, even
-    // minified=0 — merge it in from one bulk `/api/me` fetch instead of
-    // hitting each book's expanded endpoint (see absMediaProgressProvider).
-    // Best-effort: if this fails (offline, slow), items just show no
-    // progress rather than blocking the whole page.
+    // minified=0 — merge it in from one bulk metadata-server fetch instead
+    // of hitting each book's expanded endpoint (see
+    // metadataProgressProvider). Best-effort: if this fails (offline,
+    // slow), items just show no progress rather than blocking the whole
+    // page.
     try {
-      final progressByItemId = await ref.read(
-        absMediaProgressProvider.future,
-      );
-      if (progressByItemId.isNotEmpty) {
+      final progress = await ref.read(metadataProgressProvider.future);
+      if (progress != null && progress.bookProgress.isNotEmpty) {
         newItems = newItems.map((item) {
-          final entry = progressByItemId[item.id];
-          if (entry == null) return item;
+          final book = progress.bookProgress[item.id];
+          if (book == null) return item;
           return item.copyWithAbsProgress(
-            progressFraction: entry.progressFraction,
-            currentTimeSec: entry.currentTime,
+            progressFraction: book.progressFraction,
+            currentTimeSec: book.progressFraction <= 0
+                ? null
+                : book.wholeBookSeconds(item.chapters),
           );
         }).toList();
-        // Bulk-restore per-chapter "listened" marks for every book the
-        // server already knows about — so a fresh install / relogin shows
-        // correct state across the whole library, not just books the
-        // user happens to open. Fire-and-forget so the library paints
-        // immediately; the listened-state provider rebuilds dependent
-        // widgets (badges) on its own.
+        // Bulk-restore per-chapter "listened" marks, positions, and
+        // continue-reading bookmarks for every book the server already
+        // knows about — so a fresh install / relogin shows correct state
+        // across the whole library, not just books the user happens to
+        // open. Fire-and-forget so the library paints immediately; the
+        // listened-state provider rebuilds dependent widgets (badges) on
+        // its own.
         unawaited(
           ref
               .read(readChaptersProvider.notifier)
-              .restoreFromServerBulkProgress(progressByItemId),
+              .restoreFromMetadataBulk(progress),
         );
       }
     } catch (_) {
