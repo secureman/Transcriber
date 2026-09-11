@@ -37,6 +37,9 @@ class PlayerController extends Notifier<PlayerState> {
   // processingState.completed chapter-end hook (which the playlist no
   // longer fires mid-playlist).
   StreamSubscription<int?>? _currentIndexSub;
+  // BUG FIX v2: buffering surfacing — true while just_audio refills its
+  // buffer (slow ABS fetch). Drives the play button's spinner.
+  StreamSubscription<bool>? _bufferingSub;
   int _lastEmitMs = 0;
   int _loadedChapterIndex = -1;
 
@@ -98,6 +101,7 @@ class PlayerController extends Notifier<PlayerState> {
     _positionSub?.cancel();
     _processingSub?.cancel();
     _playingSub?.cancel();
+    _bufferingSub?.cancel();
     _progressTimer?.cancel();
     // Best-effort final progress flush when leaving the player / app.
     _saveLocalProgress();
@@ -118,7 +122,26 @@ class PlayerController extends Notifier<PlayerState> {
     _processingSub?.cancel();
     _playingSub?.cancel();
     _currentIndexSub?.cancel();
+    // BUG FIX v2: buffering surfacing. The old init ignored buffering
+    // entirely, so a slow-ABS fetch (playhead stalls mid-chapter while
+    // just_audio refills its buffer) looked identical to a frozen player.
+    // just_audio exposes buffering via processingStateStream — derive the
+    // flag from it so the play button can spin while data is en route.
+    _bufferingSub?.cancel();
+    _bufferingSub = ref
+        .read(audioHandlerProvider)
+        .player
+        .processingStateStream
+        .map((ps) => ps == ProcessingState.buffering)
+        .distinct()
+        .listen((isBuffering) {
+      state = state.copyWith(buffering: isBuffering);
+    });
     _loadedChapterIndex = chapterIndex;
+    // Re-arm the end-of-chapter fallback (see _checkClipEndFallback) for
+    // the freshly-loaded chapter — a stale guard from the previous chapter
+    // could equal this chapter's index and suppress a legitimate chapter end.
+    _clipEndFiredChapter = -1;
 
     // Fresh progress-sync context for this book.
     _syncItemId = itemId;
@@ -400,6 +423,19 @@ class PlayerController extends Notifier<PlayerState> {
 
   // ── VTT loading with offline cache ────────────────────────────────
 
+  /// Public hook for the "Download transcripts" action (player overflow
+  /// menu): re-runs [_loadVtt] for the currently-loaded chapter so a VTT
+  /// that was just bulk-cached shows up immediately without leaving the
+  /// player. No-op when nothing is loaded or a transcript is already live.
+  Future<void> reloadCurrentVtt() async {
+    final itemId = state.itemId;
+    if (itemId == null || state.hasVtt) return;
+    _vttRetryTimer?.cancel();
+    state = state.copyWith(vttStatus: VttStatus.loading);
+    await _loadVtt(itemId, state.chapterIndex);
+    if (state.vttStatus == VttStatus.ready) _syncWord(state.position);
+  }
+
   Future<void> _loadVtt(String itemId, int chapterIndex) async {
     if (!ref.read(configProvider).serverConfigured) {
       // No backend — try cache before giving up.
@@ -413,41 +449,56 @@ class PlayerController extends Notifier<PlayerState> {
     }
 
     final backend = ref.read(backendClientProvider);
+    // BUG FIX v2 (cache-first): a downloaded transcript should be shown
+    // INSTANTLY even when the backend is up. The old flow always fetched
+    // /api/vtt first and only served cache as a fallback, so every chapter
+    // switch waited a full network round-trip before any text appeared —
+    // the "Download transcripts" cache never bought anything while online.
+    // Now the cache, if present, is applied immediately and a background
+    // revalidate still runs: a 200 replaces cache + cues (so server-side
+    // re-transcriptions flow through transparently), while 202/404/errors
+    // leave the already-shown cache untouched.
+    final cached = _readCache(itemId, chapterIndex);
+    if (cached != null) {
+      _applyVtt(cached, fromCache: true);
+    }
     try {
       final res = await backend.get('/api/vtt/$itemId/$chapterIndex');
       switch (res.statusCode) {
         case 200:
           final vtt = res.data.toString();
           await _writeCache(itemId, chapterIndex, vtt); // persist for offline
-          _applyVtt(vtt, fromCache: false);
+          // Cache-first: skip the redundant cue rebuild when the server's
+          // text matches what's already on screen.
+          if (cached == null || cached != vtt) {
+            _applyVtt(vtt, fromCache: false);
+          }
           return;
 
         case 202:
-          // Server is still transcribing — serve cache immediately if we have
-          // it so the user can read while waiting for the new version.
-          final cached = _readCache(itemId, chapterIndex);
-          if (cached != null) {
-            _applyVtt(cached, fromCache: true);
-            return;
+          // Server is still transcribing. Cache-first: if we already
+          // served cache above there's nothing to do; otherwise surface
+          // the progress UI and poll for the fresh version.
+          if (cached == null) {
+            state = state.copyWith(
+              vttStatus: VttStatus.transcribing,
+              transcribeProgress: _progressFrom202(res.data),
+            );
+            _pollVtt(itemId, chapterIndex);
           }
-          state = state.copyWith(
-            vttStatus: VttStatus.transcribing,
-            transcribeProgress: _progressFrom202(res.data),
-          );
-          _pollVtt(itemId, chapterIndex);
           return;
 
         case 404:
-          final cached = _readCache(itemId, chapterIndex);
-          if (cached != null) {
-            _applyVtt(cached, fromCache: true);
-          } else {
+          // Cache-first: nothing to do when cache is already shown.
+          if (cached == null) {
             state = state.copyWith(vttStatus: VttStatus.notFound);
           }
           return;
 
         default:
-          state = state.copyWith(vttStatus: VttStatus.notFound);
+          if (cached == null) {
+            state = state.copyWith(vttStatus: VttStatus.notFound);
+          }
           return;
       }
     } catch (_) {
@@ -457,26 +508,28 @@ class PlayerController extends Notifier<PlayerState> {
       // one-shot and canceled by a chapter switch / dispose / a concurrent
       // success, and re-arms itself only while the backend stays down.
       _vttRetryTimer?.cancel();
-      final cached = _readCache(itemId, chapterIndex);
-      if (cached != null) {
-        _applyVtt(cached, fromCache: true);
-      } else {
-        state = state.copyWith(vttStatus: VttStatus.notFound);
-        _vttRetryTimer = Timer(const Duration(seconds: 45), () {
-          // Stale guard: the user may have switched chapters meanwhile.
-          if (state.itemId != itemId || state.chapterIndex != chapterIndex) {
-            return;
-          }
-          if (state.hasVtt || state.vttStatus == VttStatus.transcribing) {
-            return;
-          }
-          unawaited(_loadVtt(itemId, chapterIndex).then((_) {
-            // Successful apply (or another arm in _loadVtt's catch) has
-            // already run — nothing to do here; the future just keeps
-            // unhandled errors from surfacing.
-          }));
-        });
-      }
+      // Cache-first: text is already on screen — no retry churn while the
+      // server is down (the bulk "Download transcripts" action can still
+      // refresh explicitly via reloadCurrentVtt).
+      if (cached != null) return;
+      state = state.copyWith(vttStatus: VttStatus.notFound);
+      // No cache: don't give up permanently — transcription keeps running
+      // server-side, so re-check once after a delay. The retry is one-shot
+      // and canceled by a chapter switch / dispose / a concurrent success.
+      _vttRetryTimer = Timer(const Duration(seconds: 45), () {
+        // Stale guard: the user may have switched chapters meanwhile.
+        if (state.itemId != itemId || state.chapterIndex != chapterIndex) {
+          return;
+        }
+        if (state.hasVtt || state.vttStatus == VttStatus.transcribing) {
+          return;
+        }
+        unawaited(_loadVtt(itemId, chapterIndex).then((_) {
+          // Successful apply (or another arm in _loadVtt's catch) has
+          // already run — nothing to do here; the future just keeps
+          // unhandled errors from surfacing.
+        }));
+      });
     }
   }
 
@@ -565,6 +618,7 @@ class PlayerController extends Notifier<PlayerState> {
       state = state.copyWith(position: position);
       _syncWord(position);
       _driftSync();
+      _checkClipEndFallback(raw);
     });
 
     // BUG FIX v1: was never listening to playingStream.
@@ -572,6 +626,41 @@ class PlayerController extends Notifier<PlayerState> {
     _playingSub = handler.player.playingStream.listen((isPlaying) {
       state = state.copyWith(playing: isPlaying);
     });
+  }
+
+  // ── End-of-chapter fallback (BUG FIX v2) ───────────────────────────
+  // BUG FIX v2: chapter end used to be detected ONLY by currentIndexStream
+  // flipping to 1. With ClippingAudioSource + lazy prefetch, just_audio can
+  // finish the current clip without reliably emitting that index change on
+  // some devices (the prefetched next source may not be fully prepared when
+  // the current one exhausts, so the queue stalls instead of advancing) —
+  // the chapter would simply stop and never move on. This fallback watches
+  // the raw clip position: once it reaches the clip's end window while
+  // playing, the same chapter-end path runs. The once-per-chapter guard
+  // makes it collapse into the normal index-based advance (whichever fires
+  // first wins; the other is a no-op) and re-arms after each rebuild.
+  int _clipEndFiredChapter = -1;
+
+  void _checkClipEndFallback(Duration raw) {
+    if (_advancingPlaylist || _playlistAdvanceRunning) return;
+    final chapterIndex = state.chapterIndex;
+    if (chapterIndex == _clipEndFiredChapter) return;
+    if (!state.audioReady) return;
+    if (!ref.read(audioHandlerProvider).player.playing) return;
+    final durationMs = state.chapterDuration.inMilliseconds;
+    if (durationMs <= 0) return;
+    final rawMs = raw.inMilliseconds;
+    // Clip-relative end tolerance: the playhead reporting the exact end is
+    // racy (the position stream may emit its last tick slightly before the
+    // clip exhausts, then stall — which is precisely the failure mode this
+    // fallback exists for), so anything at or past (end − 300ms) counts as
+    // ended. No upper bound: a stalled final tick before the boundary must
+    // still fire on the next tick (or the completion tick), not slip
+    // through a two-sided window that never matches again.
+    if (rawMs >= durationMs - _chapterOffsetSeconds * 1000 - 300) {
+      _clipEndFiredChapter = chapterIndex;
+      _onChapterEnd(advanced: true);
+    }
   }
 
   void _syncWord(Duration position) {
@@ -885,6 +974,11 @@ class PlayerController extends Notifier<PlayerState> {
     }
     if (!advanced) return; // single-item playlist ended cleanly; nothing to do
     if (state.audioReady) {
+      // BUG FIX v2: flip the "advancing" indicator on BEFORE deferring the
+      // rebuild. The rebuild (network fetch of the next clip + prepare) can
+      // take seconds on a slow ABS server — with the audio now silent, the
+      // player looked crashed. The pill/spinner UI keys off this flag.
+      state = state.copyWith(advancing: true);
       // Auto-advanced into the prefetched next chapter. Rebuild the
       // queue so the now-current chapter sits at index 0 with its own
       // prefetch (nextNext) at index 1 — the prefetch chain keeps rolling.
@@ -972,6 +1066,12 @@ class PlayerController extends Notifier<PlayerState> {
 
     final current = await resolveClipBounds(nextIdx);
     final prefetch = await resolveClipBounds(nextIdx + 1);
+    // BUG FIX v2 (3-deep prefetch): also queue the chapter AFTER next, so
+    // just_audio is already two chapters ahead on slow ABS connections —
+    // the extra runway means a slow next-chapter fetch rarely stalls the
+    // transition (prefetch source[2] starts preparing only after source[1]
+    // is buffered, so this costs nothing while playback is rolling).
+    final prefetch2 = await resolveClipBounds(nextIdx + 2);
     if (current.fileIno == null) return; // can't even queue the current chapter
 
     final sources = <AudioSource>[
@@ -979,13 +1079,27 @@ class PlayerController extends Notifier<PlayerState> {
       if (prefetch.fileIno != null)
         _buildChapterSource(
             item.id, config, prefetch, isOffline: offlineBook != null),
+      if (prefetch2.fileIno != null)
+        _buildChapterSource(
+            item.id, config, prefetch2, isOffline: offlineBook != null),
     ];
 
+    // BUG FIX v2: setAudioSources pauses the player and resets position —
+    // if the audio was rolling when the chapter ended, the rebuilt queue
+    // must resume playing, otherwise the app silently advances into the
+    // next chapter but sits paused at 0:00 (no sound, no motion — the
+    // classic "chapter finished and nothing happened" report).
+    final wasPlaying = handler.player.playing;
     await handler.player.setAudioSources(
       sources,
       initialIndex: 0,
       initialPosition: Duration.zero,
     );
+    if (wasPlaying) await handler.player.play();
+
+    // The end-of-chapter fallback (see _checkClipEndFallback) fires once
+    // per chapter — re-arm it for the chapter we just advanced into.
+    _clipEndFiredChapter = -1;
 
     // Update state + sync bookkeeping for the new current chapter.
     final nextChapter = item.chapters[nextIdx];
@@ -1014,7 +1128,11 @@ class PlayerController extends Notifier<PlayerState> {
       if (state.vttStatus == VttStatus.ready) _syncWord(state.position);
     }));
     } finally {
+      // BUG FIX v2: the rebuild window is over — the next chapter's clip is
+      // prepared (or the rebuild bailed/failed, e.g. offline and no local
+      // file). Clear the indicator either way so it can never stick on.
       _playlistAdvanceRunning = false;
+      state = state.copyWith(advancing: false);
     }
   }
 

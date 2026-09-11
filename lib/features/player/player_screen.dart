@@ -7,11 +7,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/offline/offline_provider.dart';
 import '../../core/providers/config_provider.dart';
 import '../../core/providers/read_chapters_provider.dart';
 import '../../core/providers/reader_theme_provider.dart';
+import '../../core/providers/vtt_download_provider.dart';
 import '../../core/theme/app_theme.dart';
 import 'player_provider.dart';
 import 'player_state.dart';
@@ -52,6 +54,11 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    // Safety net: if the player screen is popped while fullscreen (the
+    // usual path is back → exit fullscreen first, but e.g. a deep-link or
+    // system-initiated pop skips it), release the screen wakelock so we
+    // never leave the display pinned on after leaving read-along.
+    unawaited(WakelockPlus.disable());
     super.dispose();
   }
 
@@ -78,6 +85,14 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
     ref.listen(playerProvider.select((s) => s.fullscreenReader), (_, on) {
       SystemChrome.setEnabledSystemUIMode(
         on ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+      );
+      // BUG FIX v2: hold a screen wakelock while in fullscreen read-along —
+      // the whole point of the mode is reading without touching the screen,
+      // and Android's default screen timeout would kill it mid-chapter.
+      // Toggled here (not in the provider) so leaving the player entirely
+      // also releases it in dispose() regardless of the flag's last value.
+      unawaited(
+        on ? WakelockPlus.enable() : WakelockPlus.disable(),
       );
     });
 
@@ -163,8 +178,68 @@ class _PlayerScreenState extends ConsumerState<PlayerScreen>
                 ],
               ),
             ),
+            // 4. BUG FIX v2: chapter-transition indicator. Between "current
+            // clip ended" and "next clip prepared" the audio is silent and
+            // the queue is being rebuilt — on a slow ABS server that takes
+            // seconds and read as "playback crashed". A compact pill pinned
+            // near the top says what's happening, in both normal and
+            // fullscreen (where it anchors to the top edge under the bar).
+            if (player.advancing)
+              Positioned(
+                top: fullscreen ? 16 : 76,
+                left: 0,
+                right: 0,
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: _AdvancingPill(),
+                ),
+              ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// The chapter-transition pill: spinner + "Loading next chapter…" on a dark
+/// rounded capsule, deliberately unobtrusive (no full-screen scrim — the
+/// transcript stays readable and the transition is usually 1–3 s).
+class _AdvancingPill extends StatelessWidget {
+  const _AdvancingPill();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceElevated.withValues(alpha: 0.92),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: AppColors.primary.withValues(alpha: 0.35),
+          width: 1,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: AppColors.primary,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Text(
+            'Loading next chapter…',
+            style: TextStyle(
+              color: AppColors.textPrimary,
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -242,9 +317,14 @@ class _FullscreenProgressStrip extends ConsumerWidget {
                   progress: value.clamp(0.0, 1.0).toDouble(),
                   savedProgress: savedFraction,
                   accent: theme.highlightBg,
-                  track: theme.text.withValues(
-                    alpha: theme.isDark ? 0.10 : 0.16,
-                  ),
+                  // BUG FIX v2 (theme coloring): the track used a flat dim
+                  // alpha of the text color, which vanished on Snow and got
+                  // lost inside Forest's green. Contrast is now resolved per
+                  // theme darkness so the rail reads on every theme.
+                  track: theme.isDark
+                      ? theme.text.withValues(alpha: 0.18)
+                      : theme.text.withValues(alpha: 0.30),
+                  isDark: theme.isDark,
                 ),
                 child: const SizedBox.expand(),
               ),
@@ -265,12 +345,16 @@ class _ProgressStripPainter extends CustomPainter {
     required this.savedProgress,
     required this.accent,
     required this.track,
+    required this.isDark,
   });
 
   final double progress; // 0 (start) → 1 (end of chapter)
   final double savedProgress; // last stop position from a previous session
   final Color accent;
   final Color track;
+  // From ReaderThemeData — light themes (Snow/Parchment) need a full-strength
+  // fill for the strip to be visible on paper-like backgrounds.
+  final bool isDark;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -294,32 +378,67 @@ class _ProgressStripPainter extends CustomPainter {
     canvas.restore();
     canvas.drawRRect(rail, Paint()..color = track);
 
-    // Progress fill from the top down to the current position. The lit band
-    // is a gradient peaked at the strip's vertical middle and fading toward
-    // the top and bottom ends — dimmer at the ends, a bit brighter in the
-    // middle. Clip the fill to the rail so it never spills outside the strip.
+    // BUG FIX v2 (theme coloring): the lit band used a single accent at a
+    // max 0.32 alpha fading to 0 — on Snow (near-white background) and
+    // Forest (dark-green) that was essentially invisible, reading as a
+    // strip-coloring bug. The fill now uses:
+    //  * dark themes — the accent at a clearly visible floor alpha;
+    //  * light themes — the accent at full strength. On light backgrounds
+    //    the amber/green accent needs full opacity to stand out from the
+    //    paper-like rail; anything translucent washes into it.
     final fillH = (size.height * progress).clamp(0.0, size.height).toDouble();
     if (fillH <= 0) return;
     final lit = RRect.fromRectAndRadius(
       Rect.fromLTWH(centerX - width / 2, 0, width, fillH),
       radius,
     );
+    final coreColor = isDark
+        ? accent.withValues(alpha: 0.95)
+        : accent; // light themes: full-strength accent
     canvas.drawRRect(
       lit,
       Paint()
         ..shader = LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          stops: const [0.0, 0.45, 0.5, 0.55, 1.0],
+          stops: const [0.0, 0.35, 1.0],
           colors: [
-            accent.withValues(alpha: 0.0),
-            accent.withValues(alpha: 0.20),
-            accent.withValues(alpha: 0.32),
-            accent.withValues(alpha: 0.20),
-            accent.withValues(alpha: 0.0),
+            accent.withValues(alpha: isDark ? 0.30 : 0.55),
+            accent.withValues(alpha: isDark ? 0.55 : 0.80),
+            coreColor,
           ],
         ).createShader(lit.outerRect),
     );
+
+    // BUG FIX v2 (playhead-true bright core): the old gradient's bright
+    // peak sat at the vertical midpoint of the filled region, so the glow
+    // parked mid-strip and the strip's "bright part" never corresponded to
+    // actual chapter progress. The core is now drawn as a short bright
+    // segment anchored at the fill TIP (the playhead, `progress × height`)
+    // — as the chapter plays the core rides down the strip and reaches the
+    // strip's end exactly when the chapter ends.
+    final playheadY = fillH;
+    final glowH = 26.0;
+    if (playheadY > 0 && playheadY < size.height) {
+      final coreTop = (playheadY - glowH).clamp(0.0, size.height).toDouble();
+      final core = RRect.fromRectAndRadius(
+        Rect.fromLTWH(centerX - width / 2 - 0.5, coreTop, width + 1.0,
+            playheadY - coreTop),
+        radius,
+      );
+      canvas.drawRRect(
+        core,
+        Paint()
+          ..shader = LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              coreColor.withValues(alpha: 0.0),
+              coreColor.withValues(alpha: 0.45),
+            ],
+          ).createShader(core.outerRect),
+      );
+    }
 
     // A tick marking where the user last stopped in this chapter (from the
     // playback-progress store) — only when it's meaningfully behind the
@@ -338,7 +457,8 @@ class _ProgressStripPainter extends CustomPainter {
       old.progress != progress ||
       old.savedProgress != savedProgress ||
       old.accent != accent ||
-      old.track != track;
+      old.track != track ||
+      old.isDark != isDark;
 }
 
 class _ReaderContainer extends ConsumerWidget {
@@ -605,6 +725,10 @@ class _AppBar extends ConsumerWidget {
                 showSleepTimerSheet(context);
               },
             ),
+            const Divider(height: 1),
+            // ── Download transcripts: bulk-cache VTTs so read-along keeps
+            // working when the backend is down (playback continues via ABS).
+            _VttDownloadTile(itemId: player.itemId),
             const Divider(),
             // ── Font size
             const Padding(
@@ -644,6 +768,90 @@ class _AppBar extends ConsumerWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Overflow-menu entry that bulk-caches every `done` chapter's VTT for
+/// the current book, then reloads the current chapter's transcript so the
+/// read-along text appears immediately if it wasn't available before.
+class _VttDownloadTile extends ConsumerWidget {
+  final String? itemId;
+  const _VttDownloadTile({required this.itemId});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    if (itemId == null) return const SizedBox.shrink();
+    final id = itemId!;
+    final state = ref.watch(vttDownloadProvider(id));
+
+    return ListTile(
+      leading: state.isRunning
+          ? const SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : const Icon(
+              Icons.subtitles_outlined,
+              color: AppColors.textPrimary,
+            ),
+      title: Text(
+        state.isRunning
+            ? (state.totalCount > 0
+                ? 'Caching transcripts… ${state.doneCount + state.alreadyCached}'
+                    ' of ${state.totalCount}'
+                : 'Fetching transcript list…')
+            : 'Download transcripts',
+        style: const TextStyle(color: AppColors.textPrimary, fontSize: 14),
+      ),
+      subtitle: state.isRunning
+          ? null
+          : Text(
+              'Keep read-along working offline',
+              style: const TextStyle(
+                color: AppColors.textSecondary,
+                fontSize: 12,
+              ),
+            ),
+      enabled: !state.isRunning,
+      onTap: () async {
+        Navigator.of(context).pop();
+        final messenger = ScaffoldMessenger.of(context);
+        final ok =
+            await ref.read(vttDownloadProvider(id).notifier).start(id);
+        // Reload the current chapter's transcript so a just-cached VTT
+        // shows up without leaving the player.
+        await ref.read(playerProvider.notifier).reloadCurrentVtt();
+        if (!context.mounted) return;
+        if (ok) {
+          final s = ref.read(vttDownloadProvider(id));
+          final parts = <String>[
+            if (s.doneCount > 0) '${s.doneCount} downloaded',
+            if (s.alreadyCached > 0) '${s.alreadyCached} already on device',
+          ];
+          messenger.showSnackBar(
+            SnackBar(
+              content: Text(
+                parts.isEmpty
+                    ? 'Transcripts cached — read-along works offline'
+                    : 'Transcripts saved (${parts.join(', ')})',
+              ),
+              behavior: SnackBarBehavior.floating,
+              backgroundColor: AppColors.surfaceElevated,
+            ),
+          );
+        } else {
+          final err = ref.read(vttDownloadProvider(id)).error;
+          messenger.showSnackBar(
+            SnackBar(
+              content: Text(err ?? 'Could not download transcripts'),
+              behavior: SnackBarBehavior.floating,
+              backgroundColor: AppColors.surfaceElevated,
+            ),
+          );
+        }
+      },
     );
   }
 }

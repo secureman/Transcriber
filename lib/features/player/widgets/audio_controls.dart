@@ -195,7 +195,13 @@ class _PlayPauseButton extends ConsumerWidget {
     final notifier = ref.read(playerProvider.notifier);
 
     return GestureDetector(
-      onTap: player.audioReady ? () => notifier.togglePlayPause() : null,
+      // BUG FIX v2: taps are dead during the chapter-end rebuild (the queue
+      // is being swapped underneath us) — disabling the button avoids a
+      // pause/play racing the rebuild's own resume.
+      onTap:
+          player.audioReady && !player.advancing
+              ? () => notifier.togglePlayPause()
+              : null,
       child: Container(
         width: 64,
         height: 64,
@@ -204,7 +210,7 @@ class _PlayPauseButton extends ConsumerWidget {
           border: Border.all(color: AppColors.textPrimary, width: 2),
         ),
         child: Center(
-          child: !player.audioReady
+          child: !player.audioReady || player.advancing
               ? const SizedBox(
                   width: 22,
                   height: 22,
@@ -213,13 +219,25 @@ class _PlayPauseButton extends ConsumerWidget {
                     color: AppColors.textPrimary,
                   ),
                 )
-              : Icon(
-                  player.playing
-                      ? Icons.pause_rounded
-                      : Icons.play_arrow_rounded,
-                  color: AppColors.textPrimary,
-                  size: 34,
-                ),
+              // BUG FIX v2: a slow ABS fetch (just_audio refilling its
+              // buffer) used to look identical to a frozen player — spin
+              // the button while data is en route so it reads as loading.
+              : player.buffering
+                  ? const SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: AppColors.textSecondary,
+                      ),
+                    )
+                  : Icon(
+                      player.playing
+                          ? Icons.pause_rounded
+                          : Icons.play_arrow_rounded,
+                      color: AppColors.textPrimary,
+                      size: 34,
+                    ),
         ),
       ),
     );

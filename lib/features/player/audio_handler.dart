@@ -12,15 +12,18 @@ class AudiobookAudioHandler extends BaseAudioHandler {
 
   static AudioLoadConfiguration get _loadControl => AudioLoadConfiguration(
         // Android: explicit min/max buffer windows. The defaults are
-        // 50 s, which is already generous; bumping to 60 s gives a bit
-        // more headroom on slow/lossy networks.
+        // 50 s, which is already generous; v2 bumps to 120 s — on slow
+        // or lossy ABS connections a bigger forward buffer is the
+        // difference between a seamless chapter transition and the
+        // playhead stalling mid-chapter while the data arrives.
         androidLoadControl: const AndroidLoadControl(
-          minBufferDuration: Duration(seconds: 60),
-          maxBufferDuration: Duration(seconds: 60),
+          minBufferDuration: Duration(seconds: 120),
+          maxBufferDuration: Duration(seconds: 120),
         ),
-        // iOS/macOS: ask the system to keep ~60 s of forward buffer.
+        // iOS/macOS: ask the system to keep ~120 s of forward buffer
+        // (same rationale as the Android bump above).
         darwinLoadControl: const DarwinLoadControl(
-          preferredForwardBufferDuration: Duration(seconds: 60),
+          preferredForwardBufferDuration: Duration(seconds: 120),
         ),
       );
 

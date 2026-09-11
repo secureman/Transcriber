@@ -45,6 +45,17 @@ class PlayerState {
   final double transcribeProgress; // 0..1 from the backend's 202 vtt response
   final bool
   servedFromCache; // true when VTT was served from local cache (server offline)
+  /// True while just_audio's processingState is `buffering` — the audio is
+  /// loaded but the network can't keep up (slow ABS). Surfaces as a spinner
+  /// on the play button so a slow fetch reads as "loading", not "frozen".
+  /// Session-only; never persisted.
+  final bool buffering;
+  /// True while the end-of-chapter playlist rebuild is in flight (chapter
+  /// ended, next chapter's clip is being fetched from ABS and prepared).
+  /// The audio goes silent during that window — without this flag the
+  /// player looks crashed/frozen (BUG FIX v2: the "Loading next chapter…"
+  /// pill and a spinner on the play button come from it). Session-only.
+  final bool advancing;
   /// Immersive read-along mode: hide the scrubber/controls chrome and the
   /// system bars so the transcript fills the screen (see player_screen.dart).
   /// Session-only — deliberately not persisted across restarts.
@@ -72,6 +83,8 @@ class PlayerState {
     this.isArabic = false,
     this.transcribeProgress = 0,
     this.servedFromCache = false,
+    this.buffering = false,
+    this.advancing = false,
     this.fullscreenReader = false,
   });
 
@@ -105,6 +118,8 @@ class PlayerState {
     bool? isArabic,
     double? transcribeProgress,
     bool? servedFromCache,
+    bool? buffering,
+    bool? advancing,
     bool? fullscreenReader,
   }) => PlayerState(
     itemId: itemId ?? this.itemId,
@@ -132,6 +147,8 @@ class PlayerState {
     isArabic: isArabic ?? this.isArabic,
     transcribeProgress: transcribeProgress ?? this.transcribeProgress,
     servedFromCache: servedFromCache ?? this.servedFromCache,
+    buffering: buffering ?? this.buffering,
+    advancing: advancing ?? this.advancing,
     fullscreenReader: fullscreenReader ?? this.fullscreenReader,
   );
 }

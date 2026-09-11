@@ -311,6 +311,7 @@ class TranscribeMode {
   static const chapter = 'chapter';
   static const next5 = 'next5';
   static const book = 'book';
+  static const custom = 'custom';
 }
 
 class TranscribeState {
@@ -324,22 +325,29 @@ class TranscribeController extends Notifier<TranscribeState> {
   @override
   TranscribeState build() => const TranscribeState();
 
-  /// POSTs a transcription request to the backend.
+  /// POSTs a transcription request to the backend. For [mode] ==
+  /// [TranscribeMode.custom], [chapterIndices] is sent as an explicit
+  /// `chapters` list (sorted, deduped); any other mode ignores it.
   Future<bool> start({
     required String itemId,
     required String mode,
     required int chapterIndex,
     required int totalChapters,
+    List<int> chapterIndices = const [],
   }) async {
     if (!ref.read(configProvider).serverConfigured) {
       state = const TranscribeState(
           error: 'No transcription server configured');
       return false;
     }
+    if (mode == TranscribeMode.custom && chapterIndices.isEmpty) {
+      state = const TranscribeState(error: 'No chapters selected');
+      return false;
+    }
     state = const TranscribeState(submitting: true);
     try {
       final backend = ref.read(backendClientProvider);
-      // Backend contract: mode ∈ {full, chapter, range}.
+      // Backend contract: mode ∈ {full, chapter, range, custom}.
       final Map<String, dynamic> body;
       switch (mode) {
         case TranscribeMode.chapter:
@@ -354,6 +362,13 @@ class TranscribeController extends Notifier<TranscribeState> {
             'mode': 'range',
             'from_chapter': chapterIndex,
             'count': 5,
+          };
+        case TranscribeMode.custom:
+          final indices = chapterIndices.toSet().toList()..sort();
+          body = {
+            'abs_item_id': itemId,
+            'mode': 'custom',
+            'chapters': indices,
           };
         default: // book
           body = {

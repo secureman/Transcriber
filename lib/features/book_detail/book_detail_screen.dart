@@ -17,6 +17,7 @@ import 'book_detail_provider.dart';
 import 'widgets/chapter_list_tile.dart';
 import 'widgets/download_control.dart';
 import 'widgets/transcribe_sheet.dart';
+import 'widgets/vtt_download_control.dart';
 
 class BookDetailScreen extends ConsumerWidget {
   final String itemId;
@@ -126,6 +127,8 @@ class BookDetailScreen extends ConsumerWidget {
                     itemId: itemId,
                     totalFileCount: book.audioFiles.length,
                   ),
+                  const SizedBox(height: 12),
+                  VttDownloadControl(itemId: itemId),
                   const SizedBox(height: 28),
                   const Text(
                     'Chapters',

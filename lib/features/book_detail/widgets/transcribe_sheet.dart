@@ -22,6 +22,7 @@ class TranscribeSheet extends ConsumerStatefulWidget {
 
 class _TranscribeSheetState extends ConsumerState<TranscribeSheet> {
   int _selected = 0;
+  final Set<int> _pickedChapters = {};
 
   @override
   Widget build(BuildContext context) {
@@ -47,6 +48,15 @@ class _TranscribeSheetState extends ConsumerState<TranscribeSheet> {
           mode: TranscribeMode.book,
           est: const Duration(minutes: 8),
         ),
+      (
+        label: 'Choose chapters…',
+        detail: _pickedChapters.isEmpty
+            ? 'Pick exactly which chapters to transcribe'
+            : '${_pickedChapters.length} chapter'
+                '${_pickedChapters.length == 1 ? '' : 's'} selected',
+        mode: TranscribeMode.custom,
+        est: const Duration(seconds: 0),
+      ),
     ];
 
     return SafeArea(
@@ -70,7 +80,13 @@ class _TranscribeSheetState extends ConsumerState<TranscribeSheet> {
                 selected: _selected == i,
                 label: opt.label,
                 detail: opt.detail,
-                onTap: () => setState(() => _selected = i),
+                onTap: () async {
+                  setState(() => _selected = i);
+                  if (opt.mode == TranscribeMode.custom) {
+                    await _openPicker();
+                    if (mounted) setState(() {}); // refresh the count label
+                  }
+                },
               );
             }),
             const SizedBox(height: 24),
@@ -111,15 +127,54 @@ class _TranscribeSheetState extends ConsumerState<TranscribeSheet> {
     );
   }
 
+  /// Opens the multi-select chapter picker and merges its result into
+  /// [_pickedChapters]. Nothing selected → the option stays but START is
+  /// blocked with a hint (see _start).
+  Future<void> _openPicker() async {
+    final picked = await showModalBottomSheet<Set<int>>(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => _ChapterPickerSheet(
+        itemId: widget.itemId,
+        totalChapters: widget.totalChapters,
+        initial: Set<int>.of(_pickedChapters),
+      ),
+    );
+    if (picked != null) {
+      _pickedChapters
+        ..clear()
+        ..addAll(picked);
+    }
+  }
+
   Future<void> _start() async {
-    final modes = [TranscribeMode.chapter, TranscribeMode.next5, TranscribeMode.book];
+    final modes = [
+      TranscribeMode.chapter,
+      TranscribeMode.next5,
+      TranscribeMode.book,
+      TranscribeMode.custom,
+    ];
     final mode = modes[_selected.clamp(0, modes.length - 1)];
+
+    if (mode == TranscribeMode.custom) {
+      if (_pickedChapters.isEmpty) {
+        await _openPicker();
+        if (!mounted) return;
+        if (_pickedChapters.isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('Select at least one chapter first'),
+          ));
+          return;
+        }
+      }
+    }
 
     final ok = await ref.read(transcribeProvider.notifier).start(
           itemId: widget.itemId,
           mode: mode,
           chapterIndex: widget.fromChapter,
           totalChapters: widget.totalChapters,
+          chapterIndices: _pickedChapters.toList(),
         );
 
     if (!mounted) return;
@@ -175,6 +230,168 @@ class _OptionTile extends StatelessWidget {
                 ],
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Multi-select chapter list shown as a bottom sheet when the user picks
+/// "Choose chapters…". Returns the selected chapter indices via
+/// `Navigator.pop(context, <int>{...})`, or null if dismissed.
+class _ChapterPickerSheet extends ConsumerStatefulWidget {
+  final String itemId;
+  final int totalChapters;
+  final Set<int> initial;
+
+  const _ChapterPickerSheet({
+    required this.itemId,
+    required this.totalChapters,
+    required this.initial,
+  });
+
+  @override
+  ConsumerState<_ChapterPickerSheet> createState() =>
+      _ChapterPickerSheetState();
+}
+
+class _ChapterPickerSheetState extends ConsumerState<_ChapterPickerSheet> {
+  late final Set<int> _selected = Set<int>.of(widget.initial);
+
+  @override
+  Widget build(BuildContext context) {
+    final meta = ref.watch(bookDetailProvider(widget.itemId)).valueOrNull;
+    final chapters = meta?.chapters ?? const [];
+    final allSelected =
+        chapters.isNotEmpty && _selected.length == chapters.length;
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 14),
+                decoration: BoxDecoration(
+                  color: AppColors.surfaceElevated,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _selected.isEmpty
+                        ? 'Select chapters'
+                        : '${_selected.length} chapter'
+                            '${_selected.length == 1 ? '' : 's'} selected',
+                    style: const TextStyle(
+                      color: AppColors.textPrimary,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: chapters.isEmpty
+                      ? null
+                      : () => setState(() {
+                            if (allSelected) {
+                              _selected.clear();
+                            } else {
+                              _selected
+                                ..clear()
+                                ..addAll(
+                                    List.generate(chapters.length, (i) => i));
+                            }
+                          }),
+                  child: Text(allSelected ? 'None' : 'All'),
+                ),
+              ],
+            ),
+            if (chapters.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Center(
+                  child: Text(
+                    'Chapter list unavailable',
+                    style: TextStyle(color: AppColors.textSecondary),
+                  ),
+                ),
+              )
+            else
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: chapters.length,
+                  itemBuilder: (context, i) {
+                    final checked = _selected.contains(i);
+                    return InkWell(
+                      onTap: () => setState(() {
+                        checked ? _selected.remove(i) : _selected.add(i);
+                      }),
+                      borderRadius: BorderRadius.circular(10),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 4, vertical: 8),
+                        child: Row(
+                          children: [
+                            SizedBox(
+                              width: 32,
+                              height: 32,
+                              child: Checkbox(
+                                value: checked,
+                                onChanged: (v) => setState(() {
+                                  v == true
+                                      ? _selected.add(i)
+                                      : _selected.remove(i);
+                                }),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                '${i + 1}. ${chapters[i].title}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: AppColors.textPrimary,
+                                  fontSize: 14.5,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                onPressed: _selected.isEmpty
+                    ? null
+                    : () =>
+                        Navigator.of(context).pop(Set<int>.of(_selected)),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(48),
+                ),
+                child: Text(_selected.isEmpty
+                    ? 'SELECT CHAPTERS'
+                    : 'TRANSCRIBE ${_selected.length} CHAPTER'
+                        '${_selected.length == 1 ? '' : 'S'}'),
+              ),
+            ),
+            const SizedBox(height: 8),
           ],
         ),
       ),
